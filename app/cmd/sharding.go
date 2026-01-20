@@ -29,9 +29,9 @@ func SlotInfo() error {
 	}
 
 	fmt.Println("\n╔══════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║              REDIS CLUSTER SLOT DISTRIBUTION                      ║")
+	fmt.Println("║              REDIS CLUSTER SLOT DISTRIBUTION                     ║")
 	fmt.Println("╠══════════════════════════════════════════════════════════════════╣")
-	fmt.Printf("║  Total Slots: 16384    Cluster Size: %-3d masters                  ║\n", info.Size)
+	fmt.Printf("║  Total Slots: 16384    Cluster Size: %-3d masters                 ║\n", info.Size)
 	fmt.Println("╠══════════════════════════════════════════════════════════════════╣")
 
 	// Calculate slots per node
@@ -78,24 +78,24 @@ func SlotInfo() error {
 	})
 
 	idealSlots := 16384 / len(masters)
-	fmt.Println("║                                                                    ║")
-	fmt.Println("║  Node             Slots      %      Bar                            ║")
-	fmt.Println("║  ────             ─────      ─      ───                            ║")
+	fmt.Println("║                                                                  ║")
+	fmt.Println("║  Node             Slots      %      Bar                          ║")
+	fmt.Println("║  ────             ─────      ─      ───                          ║")
 
 	for _, m := range masters {
 		pct := float64(m.slots) / 16384.0 * 100
 		barLen := int(pct / 5) // 20 chars max
 		bar := strings.Repeat("█", barLen) + strings.Repeat("░", 20-barLen)
-		fmt.Printf("║  %-16s %5d   %5.1f%%   %s  ║\n", m.address, m.slots, pct, bar)
+		fmt.Printf("║  %-16s %5d   %5.1f%%   %s  	   ║\n", m.address, m.slots, pct, bar)
 	}
 
-	fmt.Println("║                                                                    ║")
-	fmt.Printf("║  Ideal distribution: ~%d slots per master                       ║\n", idealSlots)
+	fmt.Println("║                                                                  ║")
+	fmt.Printf("║  Ideal distribution: ~%d slots per master                      ║\n", idealSlots)
 	fmt.Println("╚══════════════════════════════════════════════════════════════════╝")
 
 	// Show slot ranges
 	fmt.Println("\n┌──────────────────────────────────────────────────────────────────┐")
-	fmt.Println("│                    SLOT RANGE ASSIGNMENTS                         │")
+	fmt.Println("│                    SLOT RANGE ASSIGNMENTS                        │")
 	fmt.Println("├──────────────────────────────────────────────────────────────────┤")
 	for _, m := range masters {
 		fmt.Printf("│  %-16s → %s\n", m.address, m.ranges)
@@ -118,7 +118,7 @@ func KeySlot(args []string) error {
 	defer client.Close()
 
 	fmt.Println("\n┌──────────────────────────────────────────────────────────────────┐")
-	fmt.Println("│                    KEY TO SLOT MAPPING                            │")
+	fmt.Println("│                    KEY TO SLOT MAPPING                           │")
 	fmt.Println("├──────────────────────────────────────────────────────────────────┤")
 
 	for _, key := range args {
@@ -128,11 +128,11 @@ func KeySlot(args []string) error {
 		// Calculate hash tag if present
 		hashPart := extractHashTag(key)
 
-		fmt.Printf("│  Key: %-50s │\n", key)
+		fmt.Printf("│  Key: %-50s 	   │\n", key)
 		if hashPart != key {
 			fmt.Printf("│  Hash Tag: {%s}\n", hashPart)
 		}
-		fmt.Printf("│  Slot: %-5d  Node: %-20s                   │\n", slot, nodeAddr)
+		fmt.Printf("│  Slot: %-5d  Node: %-20s                  	   │\n", slot, nodeAddr)
 		fmt.Println("├──────────────────────────────────────────────────────────────────┤")
 	}
 	fmt.Println("└──────────────────────────────────────────────────────────────────┘")
@@ -166,7 +166,7 @@ func HashTagDemo() error {
 	defer client.Close()
 
 	fmt.Println("\n╔══════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║                   HASH TAG DEMONSTRATION                          ║")
+	fmt.Println("║                   HASH TAG DEMONSTRATION                         ║")
 	fmt.Println("╠══════════════════════════════════════════════════════════════════╣")
 	fmt.Println("║  Hash tags {} control which part of the key determines the slot  ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════════════╝")
@@ -261,7 +261,7 @@ func CrossSlotDemo() error {
 	rdb := client.Redis()
 
 	fmt.Println("\n╔══════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║              CROSS-SLOT OPERATIONS DEMONSTRATION                  ║")
+	fmt.Println("║              CROSS-SLOT OPERATIONS DEMONSTRATION                 ║")
 	fmt.Println("╠══════════════════════════════════════════════════════════════════╣")
 	fmt.Println("║  Multi-key operations require keys to be in the same slot        ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════════════╝")
@@ -363,8 +363,8 @@ func AnalyzeDistribution(args []string) error {
 	ctx := client.Context()
 
 	fmt.Println("\n╔══════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║              KEY DISTRIBUTION ANALYSIS                            ║")
-	fmt.Printf("║  Pattern: %-20s  Limit: %-10d                  ║\n", *pattern, *limit)
+	fmt.Println("║              KEY DISTRIBUTION ANALYSIS                           ║")
+	fmt.Printf("║  Pattern: %-20s  Limit: %-10d                ║\n", *pattern, *limit)
 	fmt.Println("╚══════════════════════════════════════════════════════════════════╝")
 
 	// Collect keys from all masters
@@ -413,7 +413,7 @@ func AnalyzeDistribution(args []string) error {
 		slotCount[k.slot]++
 	}
 
-	fmt.Println("\n┌── DISTRIBUTION BY NODE ──────────────────────────────────────────┐")
+	fmt.Println("\n┌── DISTRIBUTION BY NODE ───────────────────────────────────────────┐")
 	type nodeStat struct {
 		node  string
 		count int
@@ -429,12 +429,12 @@ func AnalyzeDistribution(args []string) error {
 	for _, ns := range nodeStats {
 		pct := float64(ns.count) / float64(len(keys)) * 100
 		bar := strings.Repeat("█", int(pct/5)) + strings.Repeat("░", 20-int(pct/5))
-		fmt.Printf("│  %-16s %5d keys (%5.1f%%) %s │\n", ns.node, ns.count, pct, bar)
+		fmt.Printf("│  %-16s %5d keys (%5.1f%%) %s   	    │\n", ns.node, ns.count, pct, bar)
 	}
 	fmt.Println("└───────────────────────────────────────────────────────────────────┘")
 
 	// Hot spots (slots with many keys)
-	fmt.Println("\n┌── HOT SPOTS (Slots with most keys) ─────────────────────────────┐")
+	fmt.Println("\n┌── HOT SPOTS (Slots with most keys) ───────────────────────────────┐")
 	type slotStat struct {
 		slot  int
 		count int
