@@ -1,9 +1,14 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
+	"ticket-reservation/api"
 	"ticket-reservation/cmd"
 )
 
@@ -40,6 +45,8 @@ func main() {
 		err = cmd.RunDemo()
 	case "load-test":
 		err = cmd.LoadTest(args)
+	case "get-key":
+		err = cmd.GetKey(args)
 
 	// Sharding commands
 	case "slot-info":
@@ -61,6 +68,9 @@ func main() {
 	case "migration-demo":
 		err = cmd.MigrationDemo()
 
+	case "server":
+		err = runServer(args)
+
 	case "help":
 		printUsage()
 	default:
@@ -73,6 +83,31 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func runServer(args []string) error {
+	fs := flag.NewFlagSet("server", flag.ExitOnError)
+	addr := fs.String("addr", ":8080", "Server address")
+	ttl := fs.Duration("ttl", 15*time.Minute, "Reservation TTL")
+	fs.Parse(args)
+
+	server, err := api.NewServer(*addr, *ttl)
+	if err != nil {
+		return err
+	}
+
+	// Handle graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		fmt.Println("\nShutting down server...")
+		server.Close()
+		os.Exit(0)
+	}()
+
+	return server.Start()
 }
 
 func printUsage() {
@@ -121,6 +156,13 @@ Commands:
     --event <id>            Event ID (required)
     --users <n>             Number of concurrent users (default: 50)
     --seats <n>             Seats per user (default: 2)
+
+  get-key <key>             Get data by key from Redis cluster
+
+API SERVER:
+  server                    Start HTTP API server for load testing
+    --addr <addr>           Server address (default: :8080)
+    --ttl <duration>        Reservation TTL (default: 15m)
 
 SHARDING COMMANDS:
   slot-info                 Show slot distribution across nodes

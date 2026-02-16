@@ -1,8 +1,9 @@
 # Redis Cluster Scaling Lab - Makefile
 # Ticket Reservation System
 
-.PHONY: help build start stop clean init cluster-info demo scale-up scale-add-replica scale-down failover load-test recover \
-        slot-info key-slot hash-tag-demo cross-slot-demo analyze-distribution sharding-demo reshard-demo hotkey-demo migration-demo
+.PHONY: help build start stop clean init cluster-info visualize set-replica demo scale-up scale-add-replica scale-down failover load-test recover \
+        slot-info key-slot hash-tag-demo cross-slot-demo analyze-distribution sharding-demo reshard-demo hotkey-demo migration-demo \
+        server k6-smoke k6-load k6-stress k6-concurrent k6-install get-key
 
 # Default target
 help:
@@ -19,6 +20,8 @@ help:
 	@echo ""
 	@echo "Cluster Operations:"
 	@echo "  make cluster-info  - Show cluster status"
+	@echo "  make visualize     - Visualize cluster architecture (masters & replicas)"
+	@echo "  make set-replica REPLICA=7001 MASTER=7005 - Set node as replica of master"
 	@echo "  make scale-up      - Add new master node (redis-7)"
 	@echo "  make scale-add-replica - Add replica (redis-8) to redis-7"
 	@echo "  make scale-down    - Remove node (default: redis-7)"
@@ -28,6 +31,7 @@ help:
 	@echo "Application:"
 	@echo "  make demo          - Run full demonstration"
 	@echo "  make load-test     - Run concurrent load test"
+	@echo "  make get-key KEY_NAME=mykey - Get data by key from Redis"
 	@echo ""
 	@echo "Sharding Labs:"
 	@echo "  make slot-info     - Show slot distribution across nodes"
@@ -40,10 +44,20 @@ help:
 	@echo "  make hotkey-demo   - Simulate and learn about hot keys"
 	@echo "  make migration-demo - Explain key migration"
 	@echo ""
+	@echo "k6 Load Testing:"
+	@echo "  make server        - Start HTTP API server for load testing"
+	@echo "  make k6-install    - Install k6 load testing tool"
+	@echo "  make k6-smoke      - Run smoke test (verify basic functionality)"
+	@echo "  make k6-load       - Run load test (sustained traffic)"
+	@echo "  make k6-stress     - Run stress test (find breaking point)"
+	@echo "  make k6-concurrent - Run concurrent booking test (race conditions)"
+	@echo ""
 	@echo "Examples:"
+	@echo "  make set-replica REPLICA=7001 MASTER=7005 - Make redis-1 replica of redis-5"
 	@echo "  make scale-down NODE=7008  - Remove specific node"
 	@echo "  make failover MASTER=7002  - Failover specific master"
 	@echo "  make key-slot KEY=user:123 - Check slot for key"
+	@echo "  make k6-load VUS=100 DURATION=5m - Load test with 100 users for 5m"
 	@echo ""
 
 # Build the Go application
@@ -88,6 +102,29 @@ cluster-info:
 	@echo "Cluster Info:"
 	@docker exec redis-1 redis-cli -p 7001 cluster info 2>/dev/null | grep -E "cluster_state|cluster_slots|cluster_known_nodes|cluster_size" || \
 	 docker exec redis-2 redis-cli -p 7002 cluster info | grep -E "cluster_state|cluster_slots|cluster_known_nodes|cluster_size"
+
+# Visualize cluster architecture
+visualize:
+	@chmod +x scripts/visualize-cluster.sh
+	@./scripts/visualize-cluster.sh
+
+# Set a node as replica of a master
+REPLICA ?=
+MASTER ?=
+set-replica:
+	@chmod +x scripts/set-replica.sh
+	@if [ -z "$(REPLICA)" ] || [ -z "$(MASTER)" ]; then \
+		echo "Usage: make set-replica REPLICA=<port> MASTER=<port>"; \
+		echo ""; \
+		echo "Example: make set-replica REPLICA=7001 MASTER=7005"; \
+		echo "         (Makes redis-1:7001 a replica of redis-5:7005)"; \
+		echo ""; \
+		echo "Current masters:"; \
+		docker exec redis-1 redis-cli -p 7001 cluster nodes 2>/dev/null | grep master || \
+		docker exec redis-2 redis-cli -p 7002 cluster nodes | grep master; \
+	else \
+		./scripts/set-replica.sh $(REPLICA) $(MASTER); \
+	fi
 
 # Run demo
 demo: build
@@ -139,6 +176,15 @@ reserve: build
 
 availability: build
 	cd app && ./ticket-reservation availability $(ARGS)
+
+# Get data by key
+KEY_NAME ?= ""
+get-key: build
+	@if [ -z "$(KEY_NAME)" ]; then \
+		echo "Usage: make get-key KEY_NAME=<key>"; \
+	else \
+		cd app && ./ticket-reservation get-key $(KEY_NAME); \
+	fi
 
 # Start spare nodes for scaling
 start-spare:
@@ -228,3 +274,115 @@ reshard-slots:
 			--cluster-slots $(SLOTS) \
 			--cluster-yes; \
 	fi
+
+# ============================================
+# K6 LOAD TESTING
+# ============================================
+
+# Server configuration
+SERVER_ADDR ?= :8080
+SERVER_TTL ?= 15m
+
+# k6 configuration
+VUS ?= 10
+DURATION ?= 2m
+BASE_URL ?= http://localhost:8080
+
+# Install k6 (macOS)
+k6-install:
+	@echo "Installing k6..."
+	@if command -v brew &> /dev/null; then \
+		brew install k6; \
+	elif command -v apt-get &> /dev/null; then \
+		sudo gpg -k; \
+		sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69; \
+		echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list; \
+		sudo apt-get update; \
+		sudo apt-get install k6; \
+	else \
+		echo "Please install k6 manually: https://k6.io/docs/get-started/installation/"; \
+	fi
+	@echo "k6 installed successfully!"
+
+# Start API server for load testing
+server: build
+	@echo "Starting API server on $(SERVER_ADDR)..."
+	cd app && ./ticket-reservation server --addr $(SERVER_ADDR) --ttl $(SERVER_TTL)
+
+# Start API server in background
+server-bg: build
+	@echo "Starting API server in background on $(SERVER_ADDR)..."
+	@cd app && nohup ./ticket-reservation server --addr $(SERVER_ADDR) --ttl $(SERVER_TTL) > ../server.log 2>&1 &
+	@sleep 2
+	@echo "Server started. Logs: server.log"
+	@echo "To stop: make server-stop"
+
+# Stop background server
+server-stop:
+	@echo "Stopping API server..."
+	@pkill -f "ticket-reservation server" || echo "Server not running"
+
+# k6 smoke test - verify basic functionality
+k6-smoke:
+	@echo "Running k6 smoke test..."
+	@if ! command -v k6 &> /dev/null; then \
+		echo "k6 not found. Run 'make k6-install' first."; \
+		exit 1; \
+	fi
+	k6 run --env BASE_URL=$(BASE_URL) loadtest/smoke-test.js
+
+# k6 load test - sustained traffic
+k6-load:
+	@echo "Running k6 load test with $(VUS) VUs for $(DURATION)..."
+	@if ! command -v k6 &> /dev/null; then \
+		echo "k6 not found. Run 'make k6-install' first."; \
+		exit 1; \
+	fi
+	k6 run --env BASE_URL=$(BASE_URL) --env VUS=$(VUS) --env DURATION=$(DURATION) loadtest/reservation-test.js
+
+# k6 stress test - find breaking point
+k6-stress:
+	@echo "Running k6 stress test..."
+	@if ! command -v k6 &> /dev/null; then \
+		echo "k6 not found. Run 'make k6-install' first."; \
+		exit 1; \
+	fi
+	k6 run --env BASE_URL=$(BASE_URL) loadtest/stress-test.js
+
+# k6 concurrent booking test - test race conditions
+k6-concurrent:
+	@echo "Running k6 concurrent booking test with $(VUS) VUs..."
+	@if ! command -v k6 &> /dev/null; then \
+		echo "k6 not found. Run 'make k6-install' first."; \
+		exit 1; \
+	fi
+	k6 run --env BASE_URL=$(BASE_URL) --env VUS=$(VUS) loadtest/concurrent-booking-test.js
+
+# k6 with HTML report
+k6-report:
+	@echo "Running k6 load test with HTML report..."
+	@if ! command -v k6 &> /dev/null; then \
+		echo "k6 not found. Run 'make k6-install' first."; \
+		exit 1; \
+	fi
+	k6 run --env BASE_URL=$(BASE_URL) --env VUS=$(VUS) --env DURATION=$(DURATION) \
+		--out json=loadtest/results.json loadtest/reservation-test.js
+	@echo "Results saved to loadtest/results.json"
+
+# Full load test workflow
+k6-full: build
+	@echo "Running full k6 load test workflow..."
+	@echo ""
+	@echo "1. Starting API server in background..."
+	@cd app && nohup ./ticket-reservation server --addr $(SERVER_ADDR) --ttl 5m > ../server.log 2>&1 &
+	@sleep 3
+	@echo "2. Running smoke test..."
+	@k6 run --env BASE_URL=$(BASE_URL) loadtest/smoke-test.js || (make server-stop && exit 1)
+	@echo ""
+	@echo "3. Running load test..."
+	@k6 run --env BASE_URL=$(BASE_URL) --env VUS=$(VUS) --env DURATION=$(DURATION) loadtest/reservation-test.js
+	@echo ""
+	@echo "4. Stopping server..."
+	@make server-stop
+	@echo ""
+	@echo "Full load test complete!"

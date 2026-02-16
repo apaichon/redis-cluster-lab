@@ -9,7 +9,7 @@ This part explains the project structure, key code components, and how data flow
 ## 1. Project Structure
 
 ```
-cluster-labs/
+redis-cluster-lab/
 ├── docker-compose.yml      # Redis cluster infrastructure
 ├── redis.conf              # Redis configuration
 ├── Makefile                # Lab commands
@@ -17,6 +17,7 @@ cluster-labs/
 ├── app/
 │   ├── main.go             # CLI entry point & command routing
 │   ├── go.mod              # Go module definition
+│   ├── go.sum              # Go module checksums
 │   │
 │   ├── cluster/
 │   │   └── client.go       # Redis cluster client wrapper
@@ -28,12 +29,8 @@ cluster-labs/
 │   │   └── reservation.go  # Business logic
 │   │
 │   └── cmd/
-│       ├── create_event.go    # Create events
-│       ├── reserve.go         # Make reservations
-│       ├── release.go         # Cancel reservations
-│       ├── availability.go    # Check seat availability
-│       ├── waitlist.go        # Waitlist operations
-│       └── demo.go            # Full demonstration
+│       ├── commands.go     # Reservation commands (create, reserve, confirm, cancel, etc.)
+│       └── sharding.go     # Sharding demos (slot-info, hash-tag, cross-slot, etc.)
 │
 ├── scripts/
 │   ├── init-cluster.sh        # Initialize cluster
@@ -52,37 +49,66 @@ cluster-labs/
 **Purpose**: Handle connection to Redis Cluster with Docker IP mapping
 
 Key responsibilities:
-- Address mapping for Docker environments
-- Connection pool management
-- Cluster information retrieval
-- Health checking
+- Address mapping for Docker environments (remapAddress)
+- Connection pool management with custom dialer
+- Cluster information retrieval (GetClusterInfo, GetClusterNodes)
+- Slot and node operations (GetSlotForKey, GetNodeForSlot)
+- Health checking (Ping)
+- Iteration helpers (ForEachMaster, ForEachShard)
 
 ### models/models.go
 **Purpose**: Define data structures used throughout the application
 
 Key structures:
-- Event: Event metadata
-- Seat: Seat status information
-- Reservation: Booking details
-- WaitlistEntry: Waitlist queue item
+- Event: Event metadata (ID, name, venue, date, seats config, pricing)
+- Seat: Seat status information (ID, status, price, held/sold info)
+- Reservation: Booking details (ID, event, user, seats, status, amounts, timestamps)
+- WaitlistEntry: Waitlist queue item (ID, event, user, requested seats, priority)
+- EventStats: Availability statistics (total, available, pending, sold, revenue)
+- ClusterNode: Redis cluster node info (ID, address, role, slots)
+- ClusterInfo: Cluster state information (state, slots assigned, nodes)
 
 ### service/reservation.go
 **Purpose**: Core business logic for reservations
 
 Key features:
-- Lua scripts for atomic operations
-- Reservation workflow management
-- Waitlist processing
-- TTL handling
+- Lua scripts for atomic operations (reserve, confirm, release)
+- Reservation workflow: CreateEvent → ReserveSeats → ConfirmReservation
+- Cancellation with seat release (CancelReservation)
+- Waitlist management (JoinWaitlist, ProcessWaitlist)
+- TTL handling for pending reservations (auto-expiry)
+- Statistics and availability (GetAvailability, GetAvailableSeats)
+- Visual seat map display (PrintSeatMap)
 
-### cmd/*.go
-**Purpose**: CLI command implementations
+### cmd/commands.go
+**Purpose**: Core reservation CLI commands
 
-Each file handles a specific command:
-- create_event.go: Initialize new events
-- reserve.go: Book seats
-- release.go: Cancel bookings
-- availability.go: Check open seats
+Key functions:
+- ClusterInfo: Display Redis cluster status
+- CreateEvent: Initialize new events with seat grid
+- ListEvents: Scan cluster for all events
+- ReserveSeats: Book seats for a user
+- ConfirmReservation: Complete pending booking
+- CancelReservation: Cancel and release seats
+- GetAvailability: Check seat statistics
+- ShowSeatMap: Display visual seat grid
+- JoinWaitlist: Add user to event waitlist
+- RunDemo: Full demonstration scenario
+- LoadTest: Concurrent reservation load test
+
+### cmd/sharding.go
+**Purpose**: Sharding demonstration and analysis commands
+
+Key functions:
+- SlotInfo: Display slot distribution across nodes
+- KeySlot: Show which slot/node keys map to
+- HashTagDemo: Demonstrate hash tags for co-location
+- CrossSlotDemo: Demonstrate cross-slot limitations
+- AnalyzeDistribution: Analyze key distribution in cluster
+- ShardingDemo: Comprehensive sharding demonstration
+- ReshardDemo: Explain resharding process
+- SimulateHotKey: Hot key detection simulation
+- MigrationDemo: Key migration explanation
 
 ---
 
@@ -95,7 +121,7 @@ The core challenge: Redis nodes announce Docker internal IPs.
 ```go
 // cluster/client.go
 
-// Maps internal Docker IPs to localhost
+// addressMapper maps internal Docker IPs to localhost for host access
 var addressMapper = map[string]string{
     "172.30.0.11": "127.0.0.1",
     "172.30.0.12": "127.0.0.1",
@@ -103,9 +129,11 @@ var addressMapper = map[string]string{
     "172.30.0.14": "127.0.0.1",
     "172.30.0.15": "127.0.0.1",
     "172.30.0.16": "127.0.0.1",
+    "172.30.0.17": "127.0.0.1",
+    "172.30.0.18": "127.0.0.1",
 }
 
-// Remap Docker IP to localhost
+// remapAddress converts internal Docker IP:port to localhost:port
 func remapAddress(addr string) string {
     host, port, err := net.SplitHostPort(addr)
     if err != nil {
@@ -121,26 +149,50 @@ func remapAddress(addr string) string {
 ### Custom Dialer Configuration
 
 ```go
-// Create cluster client with custom dialer
-client := redis.NewClusterClient(&redis.ClusterOptions{
-    Addrs: []string{
+// cluster/client.go
+
+// DefaultClusterAddrs returns the default cluster node addresses
+func DefaultClusterAddrs() []string {
+    return []string{
         "127.0.0.1:7001",
         "127.0.0.1:7002",
         "127.0.0.1:7003",
-    },
+        "127.0.0.1:7004",
+        "127.0.0.1:7005",
+        "127.0.0.1:7006",
+    }
+}
 
-    // Custom dialer intercepts all connections
-    Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
-        // Remap 172.30.0.11:7001 → 127.0.0.1:7001
-        mappedAddr := remapAddress(addr)
+// NewClient creates a new Redis cluster client
+func NewClient(addrs []string) (*Client, error) {
+    if len(addrs) == 0 {
+        addrs = DefaultClusterAddrs()
+    }
 
-        netDialer := &net.Dialer{
-            Timeout:   5 * time.Second,
-            KeepAlive: 5 * time.Minute,
-        }
-        return netDialer.DialContext(ctx, network, mappedAddr)
-    },
-})
+    rdb := redis.NewClusterClient(&redis.ClusterOptions{
+        Addrs:           addrs,
+        MaxRetries:      5,
+        MinRetryBackoff: 100 * time.Millisecond,
+        MaxRetryBackoff: 500 * time.Millisecond,
+        DialTimeout:     5 * time.Second,
+        ReadTimeout:     3 * time.Second,
+        WriteTimeout:    3 * time.Second,
+        PoolSize:        10,
+        MinIdleConns:    5,
+        // Route read commands to replicas for better distribution
+        RouteRandomly: true,
+        // Custom dialer to remap Docker internal IPs to localhost
+        Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
+            mappedAddr := remapAddress(addr)
+            netDialer := &net.Dialer{
+                Timeout:   5 * time.Second,
+                KeepAlive: 5 * time.Minute,
+            }
+            return netDialer.DialContext(ctx, network, mappedAddr)
+        },
+    })
+    // ... connection test with retries
+}
 ```
 
 ---
@@ -160,64 +212,79 @@ In Redis Cluster, you cannot use standard transactions across multiple keys unle
 ```go
 // service/reservation.go
 
-var reserveSeatsScript = redis.NewScript(`
-    -- KEYS[1] = {event:ID} (event info)
-    -- KEYS[2] = {event:ID}:seats (seat map)
-    -- KEYS[3] = reservation ID
-    -- ARGV = list of seats to reserve
+// Lua script for atomic seat reservation
+// All keys use the same hash tag {event:ID} so they're in the same slot
+reserveScript := redis.NewScript(`
+    local seats_key = KEYS[1]
+    local stats_key = KEYS[2]
+    local reservation_id = ARGV[1]
+    local user_id = ARGV[2]
+    local expires_at = ARGV[3]
+    local seat_count = tonumber(ARGV[4])
 
-    -- Step 1: Check all seats are available
-    for i, seat in ipairs(ARGV) do
-        local status = redis.call('HGET', KEYS[2], seat)
+    -- Check all seats are available
+    for i = 5, 4 + seat_count do
+        local seat_id = ARGV[i]
+        local status = redis.call('HGET', seats_key, seat_id)
         if status ~= 'available' then
-            return {err = 'Seat ' .. seat .. ' not available: ' .. (status or 'nil')}
+            return {0, 'seat_unavailable', seat_id}
         end
     end
 
-    -- Step 2: All available - reserve atomically
-    local reservation_id = KEYS[3]
-    for i, seat in ipairs(ARGV) do
-        redis.call('HSET', KEYS[2], seat, 'pending:' .. reservation_id)
+    -- Reserve all seats
+    for i = 5, 4 + seat_count do
+        local seat_id = ARGV[i]
+        redis.call('HSET', seats_key, seat_id, 'pending')
     end
 
-    -- Step 3: Update statistics
-    local seat_count = #ARGV
-    redis.call('HINCRBY', KEYS[1] .. ':stats', 'available', -seat_count)
-    redis.call('HINCRBY', KEYS[1] .. ':stats', 'pending', seat_count)
+    -- Update stats
+    redis.call('HINCRBY', stats_key, 'available_seats', -seat_count)
+    redis.call('HINCRBY', stats_key, 'pending_seats', seat_count)
 
-    return {ok = 'reserved', count = seat_count}
+    return {1, reservation_id}
 `)
 ```
 
 ### Executing the Script
 
 ```go
-func (s *ReservationService) ReserveSeats(ctx context.Context, eventID string, seats []string) (*Reservation, error) {
-    reservationID := uuid.New().String()
+// service/reservation.go
 
-    // All keys use same hash tag for co-location
-    eventKey := fmt.Sprintf("{event:%s}", eventID)
-    seatsKey := fmt.Sprintf("{event:%s}:seats", eventID)
+func (s *ReservationService) ReserveSeats(eventID, userID string, seatIDs []string,
+    customerName, customerEmail string) (*models.Reservation, error) {
 
-    // Execute Lua script
-    result, err := reserveSeatsScript.Run(ctx, s.client,
-        []string{eventKey, seatsKey, reservationID},  // KEYS
-        seats...,                                       // ARGV (seats)
-    ).Result()
+    reservationID := uuid.New().String()[:12]
+    now := time.Now()
+    expiresAt := now.Add(s.reservationTTL)
 
-    if err != nil {
-        return nil, fmt.Errorf("reservation failed: %w", err)
+    // Build script arguments
+    args := []interface{}{
+        reservationID,
+        userID,
+        expiresAt.Unix(),
+        len(seatIDs),
+    }
+    for _, seatID := range seatIDs {
+        args = append(args, seatID)
     }
 
-    // Handle script response
-    // ...
+    // All keys use same hash tag for co-location
+    seatsKey := fmt.Sprintf("{event:%s}:seats", eventID)
+    statsKey := fmt.Sprintf("{event:%s}:stats", eventID)
 
-    return &Reservation{
-        ID:      reservationID,
-        EventID: eventID,
-        Seats:   seats,
-        Status:  "pending",
-    }, nil
+    // Execute Lua script
+    result, err := reserveScript.Run(s.ctx, s.rdb,
+        []string{seatsKey, statsKey}, args...).Slice()
+    if err != nil {
+        return nil, fmt.Errorf("failed to reserve seats: %w", err)
+    }
+
+    // Check result: {1, reservation_id} for success, {0, 'seat_unavailable', seat_id} for failure
+    if result[0].(int64) == 0 {
+        return nil, fmt.Errorf("seat %s is not available", result[2].(string))
+    }
+
+    // Create and store reservation record...
 }
 ```
 
@@ -229,14 +296,14 @@ func (s *ReservationService) ReserveSeats(ctx context.Context, eventID string, s
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                    RESERVATION FLOW                               │
+│                    RESERVATION FLOW                              │
 └──────────────────────────────────────────────────────────────────┘
 
 User Request                     Application                    Redis Cluster
      │                               │                               │
-     │  reserve A1,A2,A3            │                               │
-     │  for event:abc123            │                               │
-     │ ─────────────────────────────►                               │
+     │  reserve A1,A2,A3             │                               │
+     │  for event:abc123             │                               │
+     │ ─────────────────────────────►                                │
      │                               │                               │
      │                               │  1. Calculate slot            │
      │                               │     {event:abc123} → 7186     │
@@ -248,13 +315,13 @@ User Request                     Application                    Redis Cluster
      │                               │ ─────────────────────────────►│
      │                               │                               │
      │                               │     EVALSHA <script>          │
-     │                               │       KEYS[1]: {event:abc123} │
-     │                               │       KEYS[2]: {event:abc123}:seats
-     │                               │       ARGV: [A1, A2, A3]      │
+     │                               │       KEYS[1]: {event:abc123}:seats
+     │                               │       KEYS[2]: {event:abc123}:stats
+     │                               │       ARGV: [res_id, user, ts, 3, A1, A2, A3]
      │                               │                               │
      │                               │                    ┌──────────┤
      │                               │                    │ Lua runs │
-     │                               │                    │ atomically│
+     │                               │                    │atomically│
      │                               │                    │          │
      │                               │                    │ 1. Check │
      │                               │                    │    seats │
@@ -266,8 +333,8 @@ User Request                     Application                    Redis Cluster
      │                               │  4. Response: OK              │
      │                               │ ◄─────────────────────────────│
      │                               │                               │
-     │  Reservation confirmed       │                               │
-     │ ◄─────────────────────────────                               │
+     │  Reservation confirmed        │                               │
+     │ ◄─────────────────────────────                                │
      │                               │                               │
 ```
 
@@ -280,7 +347,7 @@ User Request                     Application                    Redis Cluster
 | 3 | Cluster Client | Routes request to correct node (Node 2) |
 | 4 | Redis Node | Executes Lua script atomically |
 | 5 | Lua Script | Checks all seats are "available" |
-| 6 | Lua Script | Marks seats as "pending:resID" |
+| 6 | Lua Script | Marks seats as "pending" |
 | 7 | Lua Script | Updates availability statistics |
 | 8 | Redis Node | Returns success response |
 | 9 | Application | Creates reservation record |
@@ -293,56 +360,84 @@ User Request                     Application                    Redis Cluster
 ### Pattern 1: Hash Tag for Key Generation
 
 ```go
-// Always use consistent hash tag format
-func eventKey(eventID string) string {
-    return fmt.Sprintf("{event:%s}", eventID)
-}
+// service/reservation.go
 
-func seatsKey(eventID string) string {
-    return fmt.Sprintf("{event:%s}:seats", eventID)
-}
+const (
+    // Key patterns - using hash tags {event:ID} to ensure related keys are in the same slot
+    eventKeyPattern        = "{event:%s}"              // Event metadata
+    seatsKeyPattern        = "{event:%s}:seats"        // Hash of seat statuses
+    reservationsKeyPattern = "{event:%s}:reservations" // Set of reservation IDs
+    waitlistKeyPattern     = "{event:%s}:waitlist"     // Sorted set for waitlist
+    reservationKeyPattern  = "reservation:%s"          // Individual reservation data
+    userReservationsKey    = "user:%s:reservations"    // User's reservations
+    statsKeyPattern        = "{event:%s}:stats"        // Event statistics
+)
 
-func statsKey(eventID string) string {
-    return fmt.Sprintf("{event:%s}:stats", eventID)
-}
-
-func waitlistKey(eventID string) string {
-    return fmt.Sprintf("{event:%s}:waitlist", eventID)
-}
+// Usage example:
+eventKey := fmt.Sprintf(eventKeyPattern, eventID)       // {event:abc123}
+seatsKey := fmt.Sprintf(seatsKeyPattern, eventID)       // {event:abc123}:seats
+statsKey := fmt.Sprintf(statsKeyPattern, eventID)       // {event:abc123}:stats
 ```
 
 ### Pattern 2: TTL for Pending Reservations
 
 ```go
-// Set expiration on pending reservation
-func (s *Service) setReservationTTL(ctx context.Context, resID string) error {
-    key := fmt.Sprintf("reservation:%s", resID)
-    return s.client.Expire(ctx, key, 15*time.Minute).Err()
+// service/reservation.go
+
+const (
+    // Default reservation hold time (15 minutes)
+    DefaultReservationTTL = 15 * time.Minute
+)
+
+// ReservationService handles ticket reservation operations
+type ReservationService struct {
+    rdb            *redis.ClusterClient
+    ctx            context.Context
+    reservationTTL time.Duration
 }
+
+// Store reservation with TTL
+resKey := fmt.Sprintf(reservationKeyPattern, reservationID)
+pipe.Set(s.ctx, resKey, resJSON, s.reservationTTL)  // Expires automatically
+
+// For confirmed reservations, remove TTL
+s.rdb.Set(s.ctx, resKey, resJSON, 0)  // No expiry for confirmed
 ```
 
 ### Pattern 3: Pipeline for Multiple Independent Operations
 
 ```go
-// Use pipeline when operations are independent
-func (s *Service) GetEventStats(ctx context.Context, eventID string) (*Stats, error) {
-    pipe := s.client.Pipeline()
+// service/reservation.go
 
-    // Queue multiple commands
-    availableCmd := pipe.HGet(ctx, statsKey(eventID), "available")
-    pendingCmd := pipe.HGet(ctx, statsKey(eventID), "pending")
-    soldCmd := pipe.HGet(ctx, statsKey(eventID), "sold")
+// GetAvailability returns event availability statistics
+func (s *ReservationService) GetAvailability(eventID string) (*models.EventStats, error) {
+    statsKey := fmt.Sprintf(statsKeyPattern, eventID)
+    waitlistKey := fmt.Sprintf(waitlistKeyPattern, eventID)
 
-    // Execute all at once
-    _, err := pipe.Exec(ctx)
+    pipe := s.rdb.Pipeline()
+    statsCmd := pipe.HGetAll(s.ctx, statsKey)
+    waitlistCmd := pipe.ZCard(s.ctx, waitlistKey)
+
+    _, err := pipe.Exec(s.ctx)
     if err != nil {
-        return nil, err
+        return nil, fmt.Errorf("failed to get availability: %w", err)
     }
 
-    return &Stats{
-        Available: availableCmd.Val(),
-        Pending:   pendingCmd.Val(),
-        Sold:      soldCmd.Val(),
+    statsMap := statsCmd.Val()
+    totalSeats, _ := strconv.Atoi(statsMap["total_seats"])
+    availableSeats, _ := strconv.Atoi(statsMap["available_seats"])
+    pendingSeats, _ := strconv.Atoi(statsMap["pending_seats"])
+    soldSeats, _ := strconv.Atoi(statsMap["sold_seats"])
+    revenue, _ := strconv.ParseFloat(statsMap["revenue"], 64)
+
+    return &models.EventStats{
+        EventID:        eventID,
+        TotalSeats:     totalSeats,
+        AvailableSeats: availableSeats,
+        PendingSeats:   pendingSeats,
+        SoldSeats:      soldSeats,
+        WaitlistCount:  int(waitlistCmd.Val()),
+        Revenue:        revenue,
     }, nil
 }
 ```
@@ -350,23 +445,24 @@ func (s *Service) GetEventStats(ctx context.Context, eventID string) (*Stats, er
 ### Pattern 4: Error Handling from Lua Scripts
 
 ```go
-// Lua scripts return structured errors
-func handleLuaResult(result interface{}) error {
-    switch v := result.(type) {
-    case []interface{}:
-        if len(v) >= 2 && v[0] == "err" {
-            return fmt.Errorf("script error: %v", v[1])
-        }
-        return nil
-    case string:
-        if v == "OK" {
-            return nil
-        }
-        return fmt.Errorf("unexpected result: %s", v)
-    default:
-        return fmt.Errorf("unknown result type: %T", result)
-    }
+// service/reservation.go
+
+// Lua scripts return array results for structured responses
+// Reserve script returns: {1, reservation_id} for success
+//                        {0, 'seat_unavailable', seat_id} for failure
+
+result, err := reserveScript.Run(s.ctx, s.rdb,
+    []string{seatsKey, statsKey}, args...).Slice()
+if err != nil {
+    return nil, fmt.Errorf("failed to reserve seats: %w", err)
 }
+
+// Check first element for success/failure
+if result[0].(int64) == 0 {
+    return nil, fmt.Errorf("seat %s is not available", result[2].(string))
+}
+
+// Success - result[1] contains reservation_id
 ```
 
 ---

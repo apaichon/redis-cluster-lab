@@ -453,6 +453,102 @@ func RunDemo() error {
 	return nil
 }
 
+// GetKey retrieves data by key from Redis cluster
+func GetKey(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("key is required")
+	}
+	key := args[0]
+
+	client, err := cluster.NewClient(nil)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	ctx := client.Context()
+	rdb := client.Redis()
+
+	// Check if key exists and get its type
+	keyType, err := rdb.Type(ctx, key).Result()
+	if err != nil {
+		return err
+	}
+	if keyType == "none" {
+		fmt.Printf("Key '%s' not found\n", key)
+		return nil
+	}
+
+	// Show slot info
+	slot := client.GetSlotForKey(key)
+	nodeAddr, _ := client.GetNodeForSlot(slot)
+
+	fmt.Println("\n========================================")
+	fmt.Println("           GET KEY")
+	fmt.Println("========================================")
+	fmt.Printf("Key:    %s\n", key)
+	fmt.Printf("Type:   %s\n", keyType)
+	fmt.Printf("Slot:   %d (Node: %s)\n", slot, nodeAddr)
+	fmt.Println("----------------------------------------")
+
+	// Get value based on type
+	switch keyType {
+	case "string":
+		val, err := rdb.Get(ctx, key).Result()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Value:\n%s\n", val)
+
+	case "list":
+		vals, err := rdb.LRange(ctx, key, 0, -1).Result()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Values (%d items):\n", len(vals))
+		for i, v := range vals {
+			fmt.Printf("  [%d] %s\n", i, v)
+		}
+
+	case "set":
+		vals, err := rdb.SMembers(ctx, key).Result()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Members (%d items):\n", len(vals))
+		for _, v := range vals {
+			fmt.Printf("  - %s\n", v)
+		}
+
+	case "zset":
+		vals, err := rdb.ZRangeWithScores(ctx, key, 0, -1).Result()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Members (%d items):\n", len(vals))
+		for _, v := range vals {
+			fmt.Printf("  - %v (score: %v)\n", v.Member, v.Score)
+		}
+
+	case "hash":
+		vals, err := rdb.HGetAll(ctx, key).Result()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Fields (%d items):\n", len(vals))
+		for k, v := range vals {
+			fmt.Printf("  %s: %s\n", k, v)
+		}
+
+	default:
+		fmt.Printf("Unsupported type: %s\n", keyType)
+	}
+
+	fmt.Println("========================================")
+
+	return nil
+}
+
 // LoadTest runs concurrent reservation load test
 func LoadTest(args []string) error {
 	fs := flag.NewFlagSet("load-test", flag.ExitOnError)

@@ -14,7 +14,7 @@ Creating an event involves initializing multiple related keys atomically.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    CREATE EVENT WORKFLOW                         │
+│                    CREATE EVENT WORKFLOW                        │
 └─────────────────────────────────────────────────────────────────┘
 
 Step 1: Generate Event ID
@@ -82,7 +82,7 @@ The reservation process handles concurrent users trying to book the same seats.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                   RESERVATION WORKFLOW                           │
+│                   RESERVATION WORKFLOW                          │
 └─────────────────────────────────────────────────────────────────┘
 
                     ┌───────────────┐
@@ -105,7 +105,7 @@ The reservation process handles concurrent users trying to book the same seats.
               ┌─────────────┴─────────────┐
               │                           │
               ▼                           ▼
-    ┌─────────────────┐         ┌─────────────────┐
+    ┌──────────────────┐         ┌─────────────────┐
     │  Seats Available │         │ Seats NOT Avail │
     │                  │         │                 │
     │ 1. Mark pending  │         │ Return error    │
