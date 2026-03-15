@@ -9,29 +9,56 @@ import (
 	"time"
 
 	"ticket-reservation/cluster"
+	"ticket-reservation/db"
+	"ticket-reservation/models"
 	"ticket-reservation/service"
 )
 
 // Server represents the HTTP API server
 type Server struct {
-	client *cluster.Client
-	svc    *service.ReservationService
-	addr   string
+	client       *cluster.Client
+	svc          *service.ReservationService
+	readThrough  *service.ReadThroughCache
+	postgres     *db.PostgresDB
+	addr         string
 }
 
-// NewServer creates a new API server
-func NewServer(addr string, reservationTTL time.Duration) (*Server, error) {
+// NewServer creates a new API server with optional PostgreSQL integration
+func NewServer(addr string, reservationTTL time.Duration, pgDSN string) (*Server, error) {
 	client, err := cluster.NewClient(nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Redis cluster: %w", err)
 	}
 
-	svc := service.NewReservationService(client.Redis(), reservationTTL)
+	var pg *db.PostgresDB
+	if pgDSN != "" {
+		pg, err = db.NewPostgresDB(pgDSN)
+		if err != nil {
+			log.Printf("[PostgreSQL] Connection failed: %v (running in Redis-only mode)", err)
+			pg = nil
+		}
+	}
+
+	var svc *service.ReservationService
+	if pg != nil {
+		svc = service.NewReservationServiceWithPG(client.Redis(), pg, reservationTTL)
+		log.Println("[Server] Running with PostgreSQL integration")
+	} else {
+		svc = service.NewReservationService(client.Redis(), reservationTTL)
+		log.Println("[Server] Running in Redis-only mode")
+	}
+
+	var rtCache *service.ReadThroughCache
+	if pg != nil {
+		rtCache = service.NewReadThroughCache(client.Redis(), pg)
+	}
 
 	return &Server{
-		client: client,
-		svc:    svc,
-		addr:   addr,
+		client:      client,
+		svc:         svc,
+		readThrough: rtCache,
+		postgres:    pg,
+		addr:        addr,
 	}, nil
 }
 
@@ -56,12 +83,23 @@ func (s *Server) Start() error {
 	// Waitlist endpoint
 	mux.HandleFunc("/waitlist", s.handleWaitlist)
 
+	// Reconciliation endpoint (Part 7)
+	mux.HandleFunc("/reconcile", s.handleReconcile)
+
 	log.Printf("Starting API server on %s", s.addr)
+	if s.postgres != nil {
+		log.Println("PostgreSQL integration: ENABLED")
+	} else {
+		log.Println("PostgreSQL integration: DISABLED (set PG_DSN to enable)")
+	}
 	return http.ListenAndServe(s.addr, s.logMiddleware(mux))
 }
 
 // Close closes the server connections
 func (s *Server) Close() error {
+	if s.postgres != nil {
+		s.postgres.Close()
+	}
 	return s.client.Close()
 }
 
@@ -171,13 +209,39 @@ func (s *Server) createEvent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	event, err := s.svc.CreateEvent(req.Name, req.Venue, eventDate, req.Rows, req.SeatsPerRow, req.PricePerSeat)
-	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, err.Error())
-		return
-	}
+	pattern := r.URL.Query().Get("pattern")
 
-	jsonResponse(w, http.StatusCreated, event)
+	switch pattern {
+	case "write-around":
+		// Write-Around: write only to PostgreSQL, skip Redis
+		event := &models.Event{
+			ID:           fmt.Sprintf("wa-%d", time.Now().UnixNano()%100000),
+			Name:         req.Name,
+			Venue:        req.Venue,
+			Date:         eventDate,
+			TotalSeats:   req.Rows * req.SeatsPerRow,
+			Rows:         req.Rows,
+			SeatsPerRow:  req.SeatsPerRow,
+			PricePerSeat: req.PricePerSeat,
+			CreatedAt:    time.Now(),
+		}
+		if err := s.svc.CreateEventWriteAround(event); err != nil {
+			errorResponse(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		jsonResponse(w, http.StatusCreated, map[string]interface{}{
+			"pattern": "write-around",
+			"event":   event,
+		})
+	default:
+		// Default: Write-Through (write to both PG and Redis)
+		event, err := s.svc.CreateEvent(req.Name, req.Venue, eventDate, req.Rows, req.SeatsPerRow, req.PricePerSeat)
+		if err != nil {
+			errorResponse(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		jsonResponse(w, http.StatusCreated, event)
+	}
 }
 
 // Event by ID handler
@@ -213,7 +277,27 @@ func (s *Server) handleEventByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getEvent(w http.ResponseWriter, r *http.Request, eventID string) {
-	event, err := s.svc.GetEvent(eventID)
+	pattern := r.URL.Query().Get("pattern")
+
+	var event interface{}
+	var err error
+
+	switch pattern {
+	case "cache-aside":
+		event, err = s.svc.GetEventCacheAside(eventID)
+	case "read-through":
+		if s.readThrough == nil {
+			errorResponse(w, http.StatusServiceUnavailable, "Read-Through requires PostgreSQL (set PG_DSN)")
+			return
+		}
+		event, err = s.readThrough.GetEvent(eventID)
+	case "refresh-ahead":
+		event, err = s.svc.GetEventRefreshAhead(eventID)
+	default:
+		// Default: original GetEvent (fallback pattern)
+		event, err = s.svc.GetEvent(eventID)
+	}
+
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, err.Error())
 		return
@@ -228,7 +312,23 @@ func (s *Server) getAvailability(w http.ResponseWriter, r *http.Request, eventID
 		return
 	}
 
-	stats, err := s.svc.GetAvailability(eventID)
+	pattern := r.URL.Query().Get("pattern")
+
+	var stats interface{}
+	var err error
+
+	switch pattern {
+	case "read-through":
+		if s.readThrough == nil {
+			errorResponse(w, http.StatusServiceUnavailable, "Read-Through requires PostgreSQL (set PG_DSN)")
+			return
+		}
+		stats, err = s.readThrough.GetEventStats(eventID)
+	default:
+		// Default: original GetAvailability (with fallback)
+		stats, err = s.svc.GetAvailability(eventID)
+	}
+
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, err.Error())
 		return
@@ -243,17 +343,35 @@ func (s *Server) getSeats(w http.ResponseWriter, r *http.Request, eventID string
 		return
 	}
 
-	seats, err := s.svc.GetAvailableSeats(eventID)
-	if err != nil {
-		errorResponse(w, http.StatusNotFound, err.Error())
-		return
-	}
+	pattern := r.URL.Query().Get("pattern")
 
-	jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"event_id":        eventID,
-		"available_seats": seats,
-		"count":           len(seats),
-	})
+	switch pattern {
+	case "cache-aside":
+		// Cache-Aside: returns all seats with status (not just available)
+		seatsMap, err := s.svc.GetSeatsCacheAside(eventID)
+		if err != nil {
+			errorResponse(w, http.StatusNotFound, err.Error())
+			return
+		}
+		jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"event_id": eventID,
+			"pattern":  "cache-aside",
+			"seats":    seatsMap,
+			"count":    len(seatsMap),
+		})
+	default:
+		// Default: original GetAvailableSeats
+		seats, err := s.svc.GetAvailableSeats(eventID)
+		if err != nil {
+			errorResponse(w, http.StatusNotFound, err.Error())
+			return
+		}
+		jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"event_id":        eventID,
+			"available_seats": seats,
+			"count":           len(seats),
+		})
+	}
 }
 
 // Reservations handler
@@ -438,4 +556,43 @@ func (s *Server) handleWaitlist(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResponse(w, http.StatusCreated, entry)
+}
+
+// Reconciliation handler (Pattern 3)
+func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		errorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	eventID := r.URL.Query().Get("event_id")
+	if eventID == "" {
+		errorResponse(w, http.StatusBadRequest, "event_id query parameter is required")
+		return
+	}
+
+	if s.postgres == nil {
+		errorResponse(w, http.StatusServiceUnavailable, "PostgreSQL not configured — reconciliation requires a database connection")
+		return
+	}
+
+	since := time.Now().Add(-24 * time.Hour)
+	if sinceStr := r.URL.Query().Get("since"); sinceStr != "" {
+		if parsed, err := time.Parse(time.RFC3339, sinceStr); err == nil {
+			since = parsed
+		}
+	}
+
+	fixed, err := s.svc.ReconcileReservations(eventID, since)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"event_id":         eventID,
+		"since":            since.Format(time.RFC3339),
+		"mismatches_fixed": fixed,
+		"status":           "reconciliation complete",
+	})
 }

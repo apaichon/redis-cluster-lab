@@ -4,16 +4,23 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"math/rand"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"ticket-reservation/api"
 	"ticket-reservation/cluster"
+	"ticket-reservation/db"
 	"ticket-reservation/models"
 	"ticket-reservation/service"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -36,6 +43,7 @@ func CreateEvent(args []string) error {
 	rows := fs.Int("rows", 10, "Number of rows")
 	seats := fs.Int("seats", 10, "Seats per row")
 	price := fs.Float64("price", 50.00, "Price per seat")
+	pattern := fs.String("pattern", "", "Caching pattern: write-around (default: write-through)")
 	fs.Parse(args)
 
 	if *name == "" {
@@ -48,12 +56,32 @@ func CreateEvent(args []string) error {
 	}
 	defer client.Close()
 
-	svc := service.NewReservationService(client.Redis(), 15*time.Minute)
+	svc := createServiceWithPG(client.Redis(), 15*time.Minute, "")
 	eventDate := time.Now().Add(30 * 24 * time.Hour) // 30 days from now
 
-	event, err := svc.CreateEvent(*name, *venue, eventDate, *rows, *seats, *price)
-	if err != nil {
-		return err
+	var event *models.Event
+	switch *pattern {
+	case "write-around":
+		fmt.Println("[Pattern: Write-Around] Writing to PostgreSQL only, skipping Redis cache")
+		event = &models.Event{
+			ID:           uuid.New().String()[:8],
+			Name:         *name,
+			Venue:        *venue,
+			Date:         eventDate,
+			TotalSeats:   *rows * *seats,
+			Rows:         *rows,
+			SeatsPerRow:  *seats,
+			PricePerSeat: *price,
+			CreatedAt:    time.Now(),
+		}
+		if err := svc.CreateEventWriteAround(event); err != nil {
+			return err
+		}
+	default:
+		event, err = svc.CreateEvent(*name, *venue, eventDate, *rows, *seats, *price)
+		if err != nil {
+			return err
+		}
 	}
 
 	fmt.Println("\n========================================")
@@ -135,10 +163,26 @@ func ListEvents() error {
 
 // GetAvailability shows event availability
 func GetAvailability(args []string) error {
-	if len(args) == 0 {
+	// Parse --pattern flag from args
+	fs := flag.NewFlagSet("availability", flag.ExitOnError)
+	pattern := fs.String("pattern", "", "Caching pattern: cache-aside, read-through, refresh-ahead")
+
+	// Separate positional args from flags
+	var positional []string
+	var flagArgs []string
+	for i := 0; i < len(args); i++ {
+		if strings.HasPrefix(args[i], "--") || strings.HasPrefix(args[i], "-") {
+			flagArgs = append(flagArgs, args[i:]...)
+			break
+		}
+		positional = append(positional, args[i])
+	}
+	fs.Parse(flagArgs)
+
+	if len(positional) == 0 {
 		return fmt.Errorf("event ID required")
 	}
-	eventID := args[0]
+	eventID := positional[0]
 
 	client, err := cluster.NewClient(nil)
 	if err != nil {
@@ -146,16 +190,68 @@ func GetAvailability(args []string) error {
 	}
 	defer client.Close()
 
-	svc := service.NewReservationService(client.Redis(), 15*time.Minute)
-	stats, err := svc.GetAvailability(eventID)
-	if err != nil {
-		return err
+	svc := createServiceWithPG(client.Redis(), 15*time.Minute, "")
+
+	var stats *models.EventStats
+	var eventName string
+
+	switch *pattern {
+	case "cache-aside":
+		fmt.Println("[Pattern: Cache-Aside] Application manages cache")
+		event, err := svc.GetEventCacheAside(eventID)
+		if err != nil {
+			return err
+		}
+		eventName = event.Name
+		stats, err = svc.GetAvailability(eventID)
+		if err != nil {
+			return err
+		}
+
+	case "read-through":
+		fmt.Println("[Pattern: Read-Through] Cache auto-loads from database")
+		pg := connectPG("")
+		if pg == nil {
+			return fmt.Errorf("read-through pattern requires PG_DSN to be set")
+		}
+		rtCache := service.NewReadThroughCache(client.Redis(), pg)
+		stats, err = rtCache.GetEventStats(eventID)
+		if err != nil {
+			return err
+		}
+		event, _ := rtCache.GetEvent(eventID)
+		if event != nil {
+			eventName = event.Name
+		} else {
+			eventName = eventID
+		}
+
+	case "refresh-ahead":
+		fmt.Println("[Pattern: Refresh-Ahead] Proactive cache refresh before expiry")
+		event, err := svc.GetEventRefreshAhead(eventID)
+		if err != nil {
+			return err
+		}
+		eventName = event.Name
+		stats, err = svc.GetAvailability(eventID)
+		if err != nil {
+			return err
+		}
+
+	default:
+		stats, err = svc.GetAvailability(eventID)
+		if err != nil {
+			return err
+		}
+		event, _ := svc.GetEvent(eventID)
+		eventName = eventID
+		if event != nil {
+			eventName = event.Name
+		}
 	}
 
-	event, _ := svc.GetEvent(eventID)
-
 	fmt.Println("\n========================================")
-	fmt.Printf("     AVAILABILITY: %s\n", event.Name)
+	fmt.Printf("     AVAILABILITY: %s\n", eventName)
 	fmt.Println("========================================")
 	fmt.Printf("Total Seats:     %d\n", stats.TotalSeats)
 	fmt.Printf("Available:       %d\n", stats.AvailableSeats)
@@ -170,10 +266,25 @@ func GetAvailability(args []string) error {
 
 // ShowSeatMap displays the seat map
 func ShowSeatMap(args []string) error {
-	if len(args) == 0 {
+	// Parse --pattern flag from args
+	fs := flag.NewFlagSet("seat-map", flag.ExitOnError)
+	pattern := fs.String("pattern", "", "Caching pattern: cache-aside")
+
+	var positional []string
+	var flagArgs []string
+	for i := 0; i < len(args); i++ {
+		if strings.HasPrefix(args[i], "--") || strings.HasPrefix(args[i], "-") {
+			flagArgs = append(flagArgs, args[i:]...)
+			break
+		}
+		positional = append(positional, args[i])
+	}
+	fs.Parse(flagArgs)
+
+	if len(positional) == 0 {
 		return fmt.Errorf("event ID required")
 	}
-	eventID := args[0]
+	eventID := positional[0]
 
 	client, err := cluster.NewClient(nil)
 	if err != nil {
@@ -181,8 +292,56 @@ func ShowSeatMap(args []string) error {
 	}
 	defer client.Close()
 
-	svc := service.NewReservationService(client.Redis(), 15*time.Minute)
-	return svc.PrintSeatMap(eventID)
+	svc := createServiceWithPG(client.Redis(), 15*time.Minute, "")
+
+	switch *pattern {
+	case "cache-aside":
+		fmt.Println("[Pattern: Cache-Aside] Loading seats via Cache-Aside")
+		seats, err := svc.GetSeatsCacheAside(eventID)
+		if err != nil {
+			return err
+		}
+		// Print seat map from cache-aside result
+		event, _ := svc.GetEvent(eventID)
+		if event == nil {
+			event, _ = svc.GetEventCacheAside(eventID)
+		}
+		if event == nil {
+			return fmt.Errorf("event not found: %s", eventID)
+		}
+		fmt.Printf("\nSeat Map for: %s\n", event.Name)
+		fmt.Println("========================================")
+		fmt.Print("     ")
+		for s := 1; s <= event.SeatsPerRow; s++ {
+			fmt.Printf("%-4d", s)
+		}
+		fmt.Println()
+		for r := 0; r < event.Rows; r++ {
+			row := string(rune('A' + r))
+			fmt.Printf("  %s  ", row)
+			for s := 1; s <= event.SeatsPerRow; s++ {
+				seatID := fmt.Sprintf("%s%d", row, s)
+				status := seats[seatID]
+				switch status {
+				case "available":
+					fmt.Print("[  ]")
+				case "pending":
+					fmt.Print("[??]")
+				case "sold":
+					fmt.Print("[XX]")
+				default:
+					fmt.Print("[  ]")
+				}
+			}
+			fmt.Println()
+		}
+		fmt.Println("========================================")
+		fmt.Println("Legend: [  ] Available  [??] Pending  [XX] Sold")
+		return nil
+
+	default:
+		return svc.PrintSeatMap(eventID)
+	}
 }
 
 // ReserveSeats reserves seats for a user
@@ -210,7 +369,7 @@ func ReserveSeats(args []string) error {
 	}
 	defer client.Close()
 
-	svc := service.NewReservationService(client.Redis(), 15*time.Minute)
+	svc := createServiceWithPG(client.Redis(), 15*time.Minute, "")
 	reservation, err := svc.ReserveSeats(*eventID, *userID, seats, *name, *email)
 	if err != nil {
 		return err
@@ -253,7 +412,7 @@ func ConfirmReservation(args []string) error {
 	}
 	defer client.Close()
 
-	svc := service.NewReservationService(client.Redis(), 15*time.Minute)
+	svc := createServiceWithPG(client.Redis(), 15*time.Minute, "")
 	reservation, err := svc.ConfirmReservation(reservationID, *paymentID)
 	if err != nil {
 		return err
@@ -284,7 +443,7 @@ func CancelReservation(args []string) error {
 	}
 	defer client.Close()
 
-	svc := service.NewReservationService(client.Redis(), 15*time.Minute)
+	svc := createServiceWithPG(client.Redis(), 15*time.Minute, "")
 	err = svc.CancelReservation(args[0])
 	if err != nil {
 		return err
@@ -319,7 +478,7 @@ func JoinWaitlist(args []string) error {
 	}
 	defer client.Close()
 
-	svc := service.NewReservationService(client.Redis(), 15*time.Minute)
+	svc := createServiceWithPG(client.Redis(), 15*time.Minute, "")
 	entry, err := svc.JoinWaitlist(*eventID, *userID, *email, *seats)
 	if err != nil {
 		return err
@@ -354,7 +513,7 @@ func RunDemo() error {
 	fmt.Println("\n[Step 1] Cluster Status")
 	client.PrintClusterStatus()
 
-	svc := service.NewReservationService(client.Redis(), 2*time.Minute) // Short TTL for demo
+	svc := createServiceWithPG(client.Redis(), 2*time.Minute, "") // Short TTL for demo
 
 	// Create an event
 	fmt.Println("\n[Step 2] Creating Event...")
@@ -563,7 +722,7 @@ func LoadTest(args []string) error {
 	}
 	defer client.Close()
 
-	svc := service.NewReservationService(client.Redis(), 5*time.Minute)
+	svc := createServiceWithPG(client.Redis(), 5*time.Minute, "")
 
 	// Create event if not specified
 	if *eventID == "" {
@@ -649,6 +808,243 @@ func LoadTest(args []string) error {
 		stats.AvailableSeats, stats.PendingSeats, stats.SoldSeats)
 
 	fmt.Println("\n========================================")
+
+	return nil
+}
+
+// connectPG tries to connect to PostgreSQL using PG_DSN env var or explicit DSN
+func connectPG(dsn string) *db.PostgresDB {
+	if dsn == "" {
+		dsn = os.Getenv("PG_DSN")
+	}
+	if dsn == "" {
+		return nil
+	}
+
+	pg, err := db.NewPostgresDB(dsn)
+	if err != nil {
+		log.Printf("[PostgreSQL] Connection failed: %v (running in Redis-only mode)", err)
+		return nil
+	}
+	return pg
+}
+
+// createServiceWithPG creates a ReservationService with optional PostgreSQL
+func createServiceWithPG(rdb *redis.ClusterClient, ttl time.Duration, pgDSN string) *service.ReservationService {
+	pg := connectPG(pgDSN)
+	if pg != nil {
+		return service.NewReservationServiceWithPG(rdb, pg, ttl)
+	}
+	return service.NewReservationService(rdb, ttl)
+}
+
+// RunServer starts the HTTP API server
+func RunServer(args []string) error {
+	fs := flag.NewFlagSet("server", flag.ExitOnError)
+	addr := fs.String("addr", ":8080", "Server address")
+	ttl := fs.Duration("ttl", 15*time.Minute, "Reservation TTL")
+	pgDSN := fs.String("pg-dsn", "", "PostgreSQL DSN (or set PG_DSN env var)")
+	fs.Parse(args)
+
+	dsn := *pgDSN
+	if dsn == "" {
+		dsn = os.Getenv("PG_DSN")
+	}
+
+	server, err := api.NewServer(*addr, *ttl, dsn)
+	if err != nil {
+		return err
+	}
+
+	// Handle graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		fmt.Println("\nShutting down server...")
+		server.Close()
+		os.Exit(0)
+	}()
+
+	return server.Start()
+}
+
+// Reconcile reconciles Redis seats with PostgreSQL confirmed reservations
+func Reconcile(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("event ID required")
+	}
+	eventID := args[0]
+
+	pgDSN := os.Getenv("PG_DSN")
+	if pgDSN == "" {
+		return fmt.Errorf("PG_DSN environment variable is required for reconciliation")
+	}
+
+	client, err := cluster.NewClient(nil)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	svc := createServiceWithPG(client.Redis(), 15*time.Minute, pgDSN)
+
+	// Default: reconcile seats confirmed in the last 24 hours
+	since := time.Now().Add(-24 * time.Hour)
+
+	fmt.Println("\n========================================")
+	fmt.Println("   RECONCILIATION: PostgreSQL → Redis")
+	fmt.Println("========================================")
+	fmt.Printf("Event ID: %s\n", eventID)
+	fmt.Printf("Since:    %s\n", since.Format(time.RFC3339))
+	fmt.Println("----------------------------------------")
+
+	fixed, err := svc.ReconcileReservations(eventID, since)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("\nResult: %d mismatches fixed\n", fixed)
+	fmt.Println("========================================")
+
+	return nil
+}
+
+// PGDemo demonstrates all PostgreSQL integration patterns
+func PGDemo() error {
+	pgDSN := os.Getenv("PG_DSN")
+	if pgDSN == "" {
+		pgDSN = "postgres://postgres:postgres@localhost:5533/ticket_reservation?sslmode=disable"
+		fmt.Printf("Using default PG_DSN: %s\n", pgDSN)
+	}
+
+	fmt.Println("\n========================================")
+	fmt.Println("  POSTGRESQL INTEGRATION DEMO")
+	fmt.Println("  Part 7: Redis + PostgreSQL Patterns")
+	fmt.Println("========================================")
+
+	client, err := cluster.NewClient(nil)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	svc := createServiceWithPG(client.Redis(), 2*time.Minute, pgDSN)
+
+	// --- Pattern 1: Write-Through (CreateEvent) ---
+	fmt.Println("\n[Pattern 1] Write-Through: Creating Event")
+	fmt.Println("  → Write to PostgreSQL first (source of truth)")
+	fmt.Println("  → Then write to Redis (cache)")
+	fmt.Println("----------------------------------------")
+
+	event, err := svc.CreateEvent(
+		"PG Integration Concert",
+		"Hybrid Arena",
+		time.Now().Add(30*24*time.Hour),
+		5,  // 5 rows
+		10, // 10 seats per row
+		100.00,
+	)
+	if err != nil {
+		return fmt.Errorf("create event failed: %w", err)
+	}
+	fmt.Printf("  Created event: %s (ID: %s)\n", event.Name, event.ID)
+	fmt.Printf("  Total seats: %d, Price: $%.2f\n", event.TotalSeats, event.PricePerSeat)
+	fmt.Println("  ✓ Data exists in BOTH PostgreSQL and Redis")
+
+	// --- Pattern 2: Write-Through (ReserveSeats) ---
+	fmt.Println("\n[Pattern 2] Write-Through: Reserving Seats")
+	fmt.Println("  → Atomic seat lock in Redis (fast)")
+	fmt.Println("  → Record in PostgreSQL (durable)")
+	fmt.Println("----------------------------------------")
+
+	res1, err := svc.ReserveSeats(event.ID, "user1", []string{"A1", "A2", "A3"}, "Alice", "alice@example.com")
+	if err != nil {
+		return fmt.Errorf("reservation failed: %w", err)
+	}
+	fmt.Printf("  Reserved seats A1,A2,A3 (Reservation: %s)\n", res1.ID)
+
+	res2, err := svc.ReserveSeats(event.ID, "user2", []string{"B5", "B6"}, "Bob", "bob@example.com")
+	if err != nil {
+		return fmt.Errorf("reservation failed: %w", err)
+	}
+	fmt.Printf("  Reserved seats B5,B6 (Reservation: %s)\n", res2.ID)
+	fmt.Println("  ✓ Reservations stored in BOTH systems")
+
+	// Show seat map
+	fmt.Println("\n  Seat Map After Reservations:")
+	svc.PrintSeatMap(event.ID)
+
+	// --- Pattern 2: Write-Through (ConfirmReservation) ---
+	fmt.Println("\n[Pattern 2] Write-Through: Confirming Reservation")
+	fmt.Println("  → Update PostgreSQL status to confirmed")
+	fmt.Println("  → Update Redis seats to sold")
+	fmt.Println("----------------------------------------")
+
+	confirmed, err := svc.ConfirmReservation(res1.ID, "pay_pg_demo_001")
+	if err != nil {
+		return fmt.Errorf("confirm failed: %w", err)
+	}
+	fmt.Printf("  Confirmed reservation %s (Payment: %s)\n", confirmed.ID, confirmed.PaymentID)
+	fmt.Println("  ✓ Both PostgreSQL and Redis updated atomically")
+
+	// Show seat map after confirmation
+	fmt.Println("\n  Seat Map After Confirmation:")
+	svc.PrintSeatMap(event.ID)
+
+	// --- Pattern 2: Write-Through (CancelReservation) ---
+	fmt.Println("\n[Pattern 2] Write-Through: Cancelling Reservation")
+	fmt.Println("  → Release seats in Redis")
+	fmt.Println("  → Update PostgreSQL status to cancelled")
+	fmt.Println("----------------------------------------")
+
+	err = svc.CancelReservation(res2.ID)
+	if err != nil {
+		return fmt.Errorf("cancel failed: %w", err)
+	}
+	fmt.Printf("  Cancelled reservation %s\n", res2.ID)
+	fmt.Println("  ✓ Seats released in Redis, status updated in PostgreSQL")
+
+	// --- Pattern 3: Reconciliation ---
+	fmt.Println("\n[Pattern 3] Periodic Reconciliation")
+	fmt.Println("  → Query PostgreSQL for confirmed seats")
+	fmt.Println("  → Verify Redis matches, fix mismatches")
+	fmt.Println("----------------------------------------")
+
+	since := time.Now().Add(-1 * time.Hour)
+	fixed, err := svc.ReconcileReservations(event.ID, since)
+	if err != nil {
+		return fmt.Errorf("reconciliation failed: %w", err)
+	}
+	fmt.Printf("  Reconciliation complete: %d mismatches fixed\n", fixed)
+	fmt.Println("  ✓ Redis and PostgreSQL are in sync")
+
+	// --- Pattern 5: Fallback ---
+	fmt.Println("\n[Pattern 5] Fallback on Redis Failure")
+	fmt.Println("  → If Redis is unavailable, read from PostgreSQL")
+	fmt.Println("  → Ensures availability during Redis outages")
+	fmt.Println("----------------------------------------")
+	fmt.Println("  (This pattern activates automatically when Redis is down)")
+	fmt.Println("  ✓ GetEvent, GetAvailability, GetReservation all have PG fallback")
+
+	// Final stats
+	fmt.Println("\n========================================")
+	fmt.Println("  FINAL STATE")
+	fmt.Println("========================================")
+	stats, _ := svc.GetAvailability(event.ID)
+	if stats != nil {
+		fmt.Printf("  Available: %d | Pending: %d | Sold: %d\n",
+			stats.AvailableSeats, stats.PendingSeats, stats.SoldSeats)
+		fmt.Printf("  Revenue: $%.2f\n", stats.Revenue)
+	}
+
+	fmt.Println("\n  ✓ All patterns demonstrated successfully!")
+	fmt.Printf("\n  Event ID for further testing: %s\n", event.ID)
+	fmt.Println("\n  Verify PostgreSQL data:")
+	fmt.Println("  psql -h localhost -U postgres -d ticket_reservation \\")
+	fmt.Printf("    -c \"SELECT * FROM events WHERE id = '%s';\"\n", event.ID)
+	fmt.Println("========================================")
 
 	return nil
 }

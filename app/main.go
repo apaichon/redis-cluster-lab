@@ -1,14 +1,9 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
-	"time"
 
-	"ticket-reservation/api"
 	"ticket-reservation/cmd"
 )
 
@@ -68,8 +63,14 @@ func main() {
 	case "migration-demo":
 		err = cmd.MigrationDemo()
 
+	// PostgreSQL integration commands (Part 7)
+	case "pg-demo":
+		err = cmd.PGDemo()
+	case "reconcile":
+		err = cmd.Reconcile(args)
+
 	case "server":
-		err = runServer(args)
+		err = cmd.RunServer(args)
 
 	case "help":
 		printUsage()
@@ -83,31 +84,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-}
-
-func runServer(args []string) error {
-	fs := flag.NewFlagSet("server", flag.ExitOnError)
-	addr := fs.String("addr", ":8080", "Server address")
-	ttl := fs.Duration("ttl", 15*time.Minute, "Reservation TTL")
-	fs.Parse(args)
-
-	server, err := api.NewServer(*addr, *ttl)
-	if err != nil {
-		return err
-	}
-
-	// Handle graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		fmt.Println("\nShutting down server...")
-		server.Close()
-		os.Exit(0)
-	}()
-
-	return server.Start()
 }
 
 func printUsage() {
@@ -163,6 +139,13 @@ API SERVER:
   server                    Start HTTP API server for load testing
     --addr <addr>           Server address (default: :8080)
     --ttl <duration>        Reservation TTL (default: 15m)
+    --pg-dsn <dsn>          PostgreSQL DSN (or set PG_DSN env var)
+
+POSTGRESQL INTEGRATION (Part 7):
+  pg-demo                   Demonstrate all PostgreSQL integration patterns
+                            (requires PG_DSN env var or default localhost)
+  reconcile <event-id>      Reconcile Redis with PostgreSQL confirmed data
+                            (requires PG_DSN env var)
 
 SHARDING COMMANDS:
   slot-info                 Show slot distribution across nodes
@@ -183,5 +166,11 @@ Examples:
   ticket-reservation reserve --event abc123 --user user1 --seats A1,A2
   ticket-reservation confirm res_abc123 --payment pay_xyz
   ticket-reservation demo
+
+  # PostgreSQL integration
+  PG_DSN="postgres://postgres:postgres@localhost:5533/ticket_reservation?sslmode=disable" \
+    ticket-reservation pg-demo
+  PG_DSN="..." ticket-reservation reconcile <event-id>
+  PG_DSN="..." ticket-reservation server --pg-dsn "..."
 `)
 }

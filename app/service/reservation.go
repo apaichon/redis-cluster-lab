@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
 
+	"ticket-reservation/db"
 	"ticket-reservation/models"
 
 	"github.com/google/uuid"
@@ -31,6 +33,7 @@ const (
 // ReservationService handles ticket reservation operations
 type ReservationService struct {
 	rdb            *redis.ClusterClient
+	postgres       *db.PostgresDB // optional, nil = Redis-only mode
 	ctx            context.Context
 	reservationTTL time.Duration
 }
@@ -47,7 +50,15 @@ func NewReservationService(rdb *redis.ClusterClient, reservationTTL time.Duratio
 	}
 }
 
+// NewReservationServiceWithPG creates a new reservation service with PostgreSQL integration
+func NewReservationServiceWithPG(rdb *redis.ClusterClient, pg *db.PostgresDB, reservationTTL time.Duration) *ReservationService {
+	svc := NewReservationService(rdb, reservationTTL)
+	svc.postgres = pg
+	return svc
+}
+
 // CreateEvent creates a new event with a seat grid
+// Pattern 1: Write-Through — writes to PostgreSQL first (source of truth), then Redis (cache)
 func (s *ReservationService) CreateEvent(name, venue string, eventDate time.Time, rows, seatsPerRow int, pricePerSeat float64) (*models.Event, error) {
 	eventID := uuid.New().String()[:8] // Short ID for readability
 
@@ -63,7 +74,15 @@ func (s *ReservationService) CreateEvent(name, venue string, eventDate time.Time
 		CreatedAt:    time.Now(),
 	}
 
-	// Store event metadata
+	// === Write-Through: PostgreSQL first (source of truth) ===
+	if s.postgres != nil {
+		if err := s.postgres.InsertEvent(event); err != nil {
+			return nil, fmt.Errorf("[PG] failed to insert event: %w", err)
+		}
+		log.Printf("[Write-Through] Event %s written to PostgreSQL", eventID)
+	}
+
+	// === Then write to Redis (cache) ===
 	eventKey := fmt.Sprintf(eventKeyPattern, eventID)
 	eventJSON, err := json.Marshal(event)
 	if err != nil {
@@ -99,29 +118,45 @@ func (s *ReservationService) CreateEvent(name, venue string, eventDate time.Time
 
 	_, err = pipe.Exec(s.ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create event: %w", err)
+		if s.postgres != nil {
+			log.Printf("[Write-Through] WARNING: Redis write failed for event %s, but PostgreSQL has the data: %v", eventID, err)
+		} else {
+			return nil, fmt.Errorf("failed to create event: %w", err)
+		}
+	} else {
+		log.Printf("[Write-Through] Event %s written to Redis cache", eventID)
 	}
 
 	return event, nil
 }
 
 // GetEvent retrieves an event by ID
+// Pattern 5: Fallback — tries Redis first, falls back to PostgreSQL
 func (s *ReservationService) GetEvent(eventID string) (*models.Event, error) {
 	eventKey := fmt.Sprintf(eventKeyPattern, eventID)
 	eventJSON, err := s.rdb.Get(s.ctx, eventKey).Result()
+	if err == nil {
+		var event models.Event
+		if err := json.Unmarshal([]byte(eventJSON), &event); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal event: %w", err)
+		}
+		return &event, nil
+	}
+
+	// Fallback to PostgreSQL
+	if s.postgres != nil {
+		log.Printf("[Fallback] Redis unavailable for event %s, falling back to PostgreSQL", eventID)
+		pgEvent, pgErr := s.postgres.GetEvent(eventID)
+		if pgErr == nil {
+			return pgEvent, nil
+		}
+		return nil, fmt.Errorf("event not found in Redis or PostgreSQL: %s", eventID)
+	}
+
 	if err == redis.Nil {
 		return nil, fmt.Errorf("event not found: %s", eventID)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get event: %w", err)
-	}
-
-	var event models.Event
-	if err := json.Unmarshal([]byte(eventJSON), &event); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal event: %w", err)
-	}
-
-	return &event, nil
+	return nil, fmt.Errorf("failed to get event: %w", err)
 }
 
 // ReserveSeats atomically reserves seats for a user
@@ -226,6 +261,16 @@ func (s *ReservationService) ReserveSeats(eventID, userID string, seatIDs []stri
 		return nil, fmt.Errorf("failed to store reservation: %w", err)
 	}
 
+	// === Write-Through: Record pending reservation in PostgreSQL ===
+	if s.postgres != nil {
+		if pgErr := s.postgres.InsertReservation(reservation); pgErr != nil {
+			log.Printf("[Write-Through] WARNING: PG write failed for reservation %s: %v", reservationID, pgErr)
+			// Don't fail the operation — Redis has the data, reconciliation will catch up
+		} else {
+			log.Printf("[Write-Through] Reservation %s written to PostgreSQL", reservationID)
+		}
+	}
+
 	return reservation, nil
 }
 
@@ -295,6 +340,17 @@ func (s *ReservationService) ConfirmReservation(reservationID, paymentID string)
 	resJSON2, _ := json.Marshal(reservation)
 	s.rdb.Set(s.ctx, resKey, resJSON2, 0) // No expiry for confirmed reservations
 
+	// === Write-Through: Update PostgreSQL ===
+	if s.postgres != nil {
+		if pgErr := s.postgres.UpdateReservationStatus(reservationID, models.ReservationConfirmed, paymentID); pgErr != nil {
+			log.Printf("[Write-Through] WARNING: PG update failed for confirm %s: %v", reservationID, pgErr)
+		}
+		if pgErr := s.postgres.UpdateSeatStatuses(reservation.EventID, reservation.Seats, models.SeatSold, reservation.UserID); pgErr != nil {
+			log.Printf("[Write-Through] WARNING: PG seat update failed for confirm %s: %v", reservationID, pgErr)
+		}
+		log.Printf("[Write-Through] Reservation %s confirmed in PostgreSQL", reservationID)
+	}
+
 	return &reservation, nil
 }
 
@@ -331,6 +387,17 @@ func (s *ReservationService) CancelReservation(reservationID string) error {
 
 	resJSON2, _ := json.Marshal(reservation)
 	s.rdb.Set(s.ctx, resKey, resJSON2, 24*time.Hour) // Keep cancelled for 24h
+
+	// === Write-Through: Update PostgreSQL ===
+	if s.postgres != nil {
+		if pgErr := s.postgres.UpdateReservationStatus(reservationID, models.ReservationCancelled, ""); pgErr != nil {
+			log.Printf("[Write-Through] WARNING: PG update failed for cancel %s: %v", reservationID, pgErr)
+		}
+		if pgErr := s.postgres.UpdateSeatStatuses(reservation.EventID, reservation.Seats, models.SeatAvailable, ""); pgErr != nil {
+			log.Printf("[Write-Through] WARNING: PG seat update failed for cancel %s: %v", reservationID, pgErr)
+		}
+		log.Printf("[Write-Through] Reservation %s cancelled in PostgreSQL", reservationID)
+	}
 
 	// Process waitlist
 	go s.ProcessWaitlist(reservation.EventID, len(reservation.Seats))
@@ -376,6 +443,7 @@ func (s *ReservationService) releaseSeatsInternal(eventID string, seatIDs []stri
 }
 
 // GetAvailability returns event availability statistics
+// Pattern 5: Fallback — tries Redis first, falls back to PostgreSQL
 func (s *ReservationService) GetAvailability(eventID string) (*models.EventStats, error) {
 	statsKey := fmt.Sprintf(statsKeyPattern, eventID)
 	waitlistKey := fmt.Sprintf(waitlistKeyPattern, eventID)
@@ -385,15 +453,19 @@ func (s *ReservationService) GetAvailability(eventID string) (*models.EventStats
 	waitlistCmd := pipe.ZCard(s.ctx, waitlistKey)
 
 	_, err := pipe.Exec(s.ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get availability: %w", err)
-	}
-
-	statsMap := statsCmd.Val()
-	if len(statsMap) == 0 {
+	if err != nil || len(statsCmd.Val()) == 0 {
+		// Fallback to PostgreSQL
+		if s.postgres != nil {
+			log.Printf("[Fallback] Redis unavailable for stats %s, falling back to PostgreSQL", eventID)
+			return s.postgres.GetEventStats(eventID)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to get availability: %w", err)
+		}
 		return nil, fmt.Errorf("event not found: %s", eventID)
 	}
 
+	statsMap := statsCmd.Val()
 	totalSeats, _ := strconv.Atoi(statsMap["total_seats"])
 	availableSeats, _ := strconv.Atoi(statsMap["available_seats"])
 	pendingSeats, _ := strconv.Atoi(statsMap["pending_seats"])
@@ -494,22 +566,28 @@ func (s *ReservationService) ProcessWaitlist(eventID string, availableSeats int)
 }
 
 // GetReservation retrieves a reservation by ID
+// Pattern 5: Fallback — tries Redis first, falls back to PostgreSQL
 func (s *ReservationService) GetReservation(reservationID string) (*models.Reservation, error) {
 	resKey := fmt.Sprintf(reservationKeyPattern, reservationID)
 	resJSON, err := s.rdb.Get(s.ctx, resKey).Result()
+	if err == nil {
+		var reservation models.Reservation
+		if err := json.Unmarshal([]byte(resJSON), &reservation); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal reservation: %w", err)
+		}
+		return &reservation, nil
+	}
+
+	// Fallback to PostgreSQL
+	if s.postgres != nil {
+		log.Printf("[Fallback] Redis unavailable for reservation %s, falling back to PostgreSQL", reservationID)
+		return s.postgres.GetReservation(reservationID)
+	}
+
 	if err == redis.Nil {
 		return nil, fmt.Errorf("reservation not found: %s", reservationID)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get reservation: %w", err)
-	}
-
-	var reservation models.Reservation
-	if err := json.Unmarshal([]byte(resJSON), &reservation); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal reservation: %w", err)
-	}
-
-	return &reservation, nil
+	return nil, fmt.Errorf("failed to get reservation: %w", err)
 }
 
 // GetUserReservations retrieves all reservations for a user
@@ -574,6 +652,55 @@ func (s *ReservationService) PrintSeatMap(eventID string) error {
 	fmt.Println(strings.Repeat("=", 40))
 
 	return nil
+}
+
+// ReconcileReservations syncs PostgreSQL confirmed seats to Redis (Pattern 3: Periodic Reconciliation)
+func (s *ReservationService) ReconcileReservations(eventID string, since time.Time) (int, error) {
+	if s.postgres == nil {
+		return 0, fmt.Errorf("PostgreSQL not configured — reconciliation requires a database connection")
+	}
+
+	log.Printf("[Reconciliation] Starting reconciliation for event %s since %s", eventID, since.Format(time.RFC3339))
+
+	// Get confirmed seats from PostgreSQL since last sync
+	confirmedSeats, err := s.postgres.GetConfirmedSeatsSince(eventID, since)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get confirmed seats from PostgreSQL: %w", err)
+	}
+
+	if len(confirmedSeats) == 0 {
+		log.Printf("[Reconciliation] No seats to reconcile")
+		return 0, nil
+	}
+
+	// Check each seat in Redis and fix mismatches
+	seatsKey := fmt.Sprintf(seatsKeyPattern, eventID)
+	fixed := 0
+
+	for _, seat := range confirmedSeats {
+		// Get current Redis status
+		redisStatus, err := s.rdb.HGet(s.ctx, seatsKey, seat.SeatID).Result()
+		if err != nil {
+			log.Printf("[Reconciliation] WARNING: Could not read Redis seat %s: %v", seat.SeatID, err)
+			continue
+		}
+
+		// If Redis doesn't show this seat as sold, fix it
+		if redisStatus != string(models.SeatSold) {
+			log.Printf("[Reconciliation] MISMATCH: Seat %s is '%s' in Redis but confirmed in PG (reservation %s). Fixing...",
+				seat.SeatID, redisStatus, seat.ReservationID)
+
+			err = s.rdb.HSet(s.ctx, seatsKey, seat.SeatID, string(models.SeatSold)).Err()
+			if err != nil {
+				log.Printf("[Reconciliation] ERROR: Failed to fix seat %s in Redis: %v", seat.SeatID, err)
+				continue
+			}
+			fixed++
+		}
+	}
+
+	log.Printf("[Reconciliation] Complete: checked %d seats, fixed %d mismatches", len(confirmedSeats), fixed)
+	return fixed, nil
 }
 
 // CleanupExpiredReservations cleans up expired pending reservations

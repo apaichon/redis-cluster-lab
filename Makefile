@@ -1,7 +1,7 @@
 # Redis Cluster Scaling Lab - Makefile
 # Ticket Reservation System
 
-.PHONY: help build start stop clean init cluster-info visualize set-replica demo scale-up scale-add-replica scale-down failover load-test recover \
+.PHONY: help build start stop clean init init-db cluster-info visualize set-replica demo scale-up scale-add-replica scale-down failover load-test recover \
         slot-info key-slot hash-tag-demo cross-slot-demo analyze-distribution sharding-demo reshard-demo hotkey-demo migration-demo \
         server k6-smoke k6-load k6-stress k6-concurrent k6-install get-key
 
@@ -17,6 +17,7 @@ help:
 	@echo "  make stop          - Stop all containers"
 	@echo "  make clean         - Remove all containers and volumes"
 	@echo "  make init          - Initialize the cluster (after start)"
+	@echo "  make init-db       - Initialize PostgreSQL database schema"
 	@echo ""
 	@echo "Cluster Operations:"
 	@echo "  make cluster-info  - Show cluster status"
@@ -92,6 +93,73 @@ clean:
 init:
 	@chmod +x scripts/*.sh
 	./scripts/init-cluster.sh
+
+# Initialize PostgreSQL database schema
+PG_PORT ?= 5533
+PG_USER ?= postgres
+PG_PASS ?= postgres
+PG_DB   ?= ticket_reservation
+init-db:
+	@echo "Initializing PostgreSQL database schema..."
+	@docker exec postgres pg_isready -U $(PG_USER) > /dev/null 2>&1 || \
+		(echo "Error: PostgreSQL container 'postgres' is not running. Run 'make start' first." && exit 1)
+	@docker exec postgres psql -U $(PG_USER) -d $(PG_DB) -c "\
+		CREATE TABLE IF NOT EXISTS events ( \
+			id            VARCHAR(36) PRIMARY KEY, \
+			name          VARCHAR(255) NOT NULL, \
+			venue         VARCHAR(255) NOT NULL, \
+			event_date    TIMESTAMP NOT NULL, \
+			total_seats   INTEGER NOT NULL, \
+			rows          INTEGER NOT NULL, \
+			seats_per_row INTEGER NOT NULL, \
+			price_per_seat NUMERIC(10,2) NOT NULL, \
+			created_at    TIMESTAMP NOT NULL DEFAULT NOW() \
+		); \
+		CREATE TABLE IF NOT EXISTS seats ( \
+			event_id VARCHAR(36) NOT NULL REFERENCES events(id), \
+			seat_id  VARCHAR(10) NOT NULL, \
+			row_letter VARCHAR(1) NOT NULL, \
+			seat_number INTEGER NOT NULL, \
+			status   VARCHAR(20) NOT NULL DEFAULT 'available', \
+			price    NUMERIC(10,2) NOT NULL, \
+			held_by  VARCHAR(36), \
+			sold_to  VARCHAR(36), \
+			updated_at TIMESTAMP NOT NULL DEFAULT NOW(), \
+			PRIMARY KEY (event_id, seat_id) \
+		); \
+		CREATE TABLE IF NOT EXISTS reservations ( \
+			id             VARCHAR(36) PRIMARY KEY, \
+			event_id       VARCHAR(36) NOT NULL REFERENCES events(id), \
+			user_id        VARCHAR(36) NOT NULL, \
+			status         VARCHAR(20) NOT NULL DEFAULT 'pending', \
+			total_amount   NUMERIC(10,2) NOT NULL, \
+			customer_name  VARCHAR(255), \
+			customer_email VARCHAR(255), \
+			payment_id     VARCHAR(100), \
+			created_at     TIMESTAMP NOT NULL DEFAULT NOW(), \
+			expires_at     TIMESTAMP NOT NULL, \
+			confirmed_at   TIMESTAMP, \
+			cancelled_at   TIMESTAMP \
+		); \
+		CREATE TABLE IF NOT EXISTS reservation_seats ( \
+			reservation_id VARCHAR(36) NOT NULL REFERENCES reservations(id), \
+			event_id       VARCHAR(36) NOT NULL, \
+			seat_id        VARCHAR(10) NOT NULL, \
+			PRIMARY KEY (reservation_id, seat_id), \
+			FOREIGN KEY (event_id, seat_id) REFERENCES seats(event_id, seat_id) \
+		); \
+		CREATE INDEX IF NOT EXISTS idx_seats_event_status ON seats(event_id, status); \
+		CREATE INDEX IF NOT EXISTS idx_reservations_event ON reservations(event_id); \
+		CREATE INDEX IF NOT EXISTS idx_reservations_user ON reservations(user_id); \
+		CREATE INDEX IF NOT EXISTS idx_reservations_status ON reservations(status); \
+		CREATE INDEX IF NOT EXISTS idx_reservation_seats_event ON reservation_seats(event_id, seat_id); \
+	"
+	@echo ""
+	@echo "Database schema initialized!"
+	@echo "Tables: events, seats, reservations, reservation_seats"
+	@echo ""
+	@echo "Verify with:"
+	@echo "  docker exec postgres psql -U $(PG_USER) -d $(PG_DB) -c '\\dt'"
 
 # Show cluster status
 cluster-info:

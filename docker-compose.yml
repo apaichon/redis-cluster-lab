@@ -149,6 +149,28 @@ services:
       timeout: 3s
       retries: 5
 
+  # PostgreSQL for durable storage (Part 7 - PostgreSQL Integration)
+  # Host port 5533 to avoid conflict with local PostgreSQL (container still runs on 5432 internally)
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_DB: ticket_reservation
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5533:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      redis-cluster:
+        ipv4_address: 172.30.0.20
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   # Spare nodes for scaling exercises
   redis-7:
     image: redis:7.2-alpine
@@ -218,3 +240,4 @@ volumes:
   redis-6-data:
   redis-7-data:
   redis-8-data:
+  postgres-data:
