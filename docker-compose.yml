@@ -19,15 +19,16 @@ services:
       - "17001:17001"
     volumes:
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-      - ../data/redis-1-data:/data
+      - redis-1-data:/data
     networks:
       redis-cluster:
         ipv4_address: 172.30.0.11
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7001", "ping"]
-      interval: 5s
-      timeout: 3s
+      interval: 3s
+      timeout: 2s
       retries: 5
+      start_period: 5s
 
   redis-2:
     image: redis:7.2-alpine
@@ -43,15 +44,16 @@ services:
       - "17002:17002"
     volumes:
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-      - ../data/redis-2-data:/data
+      - redis-2-data:/data
     networks:
       redis-cluster:
         ipv4_address: 172.30.0.12
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7002", "ping"]
-      interval: 5s
-      timeout: 3s
+      interval: 3s
+      timeout: 2s
       retries: 5
+      start_period: 5s
 
   redis-3:
     image: redis:7.2-alpine
@@ -67,15 +69,16 @@ services:
       - "17003:17003"
     volumes:
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-      - ../data/redis-3-data:/data
+      - redis-3-data:/data
     networks:
       redis-cluster:
         ipv4_address: 172.30.0.13
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7003", "ping"]
-      interval: 5s
-      timeout: 3s
+      interval: 3s
+      timeout: 2s
       retries: 5
+      start_period: 5s
 
   redis-4:
     image: redis:7.2-alpine
@@ -91,15 +94,16 @@ services:
       - "17004:17004"
     volumes:
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-      - ../data/redis-4-data:/data
+      - redis-4-data:/data
     networks:
       redis-cluster:
         ipv4_address: 172.30.0.14
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7004", "ping"]
-      interval: 5s
-      timeout: 3s
+      interval: 3s
+      timeout: 2s
       retries: 5
+      start_period: 5s
 
   redis-5:
     image: redis:7.2-alpine
@@ -115,15 +119,16 @@ services:
       - "17005:17005"
     volumes:
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-      - ../data/redis-5-data:/data
+      - redis-5-data:/data
     networks:
       redis-cluster:
         ipv4_address: 172.30.0.15
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7005", "ping"]
-      interval: 5s
-      timeout: 3s
+      interval: 3s
+      timeout: 2s
       retries: 5
+      start_period: 5s
 
   redis-6:
     image: redis:7.2-alpine
@@ -139,15 +144,16 @@ services:
       - "17006:17006"
     volumes:
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-      - ../data/redis-6-data:/data
+      - redis-6-data:/data
     networks:
       redis-cluster:
         ipv4_address: 172.30.0.16
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7006", "ping"]
-      interval: 5s
-      timeout: 3s
+      interval: 3s
+      timeout: 2s
       retries: 5
+      start_period: 5s
 
   # PostgreSQL for durable storage (Part 7 - PostgreSQL Integration)
   # Host port 5533 to avoid conflict with local PostgreSQL (container still runs on 5432 internally)
@@ -167,9 +173,10 @@ services:
         ipv4_address: 172.30.0.20
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 3s
+      interval: 3s
+      timeout: 2s
       retries: 5
+      start_period: 10s
 
   # Spare nodes for scaling exercises
   redis-7:
@@ -186,7 +193,7 @@ services:
       - "17007:17007"
     volumes:
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-      - ../data/redis-7-data:/data
+      - redis-7-data:/data
     networks:
       redis-cluster:
         ipv4_address: 172.30.0.17
@@ -194,9 +201,10 @@ services:
       - scale
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7007", "ping"]
-      interval: 5s
-      timeout: 3s
+      interval: 3s
+      timeout: 2s
       retries: 5
+      start_period: 5s
 
   redis-8:
     image: redis:7.2-alpine
@@ -212,7 +220,7 @@ services:
       - "17008:17008"
     volumes:
       - ./redis.conf:/usr/local/etc/redis/redis.conf
-      - ../data/redis-8-data:/data
+      - redis-8-data:/data
     networks:
       redis-cluster:
         ipv4_address: 172.30.0.18
@@ -220,9 +228,10 @@ services:
       - scale
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7008", "ping"]
-      interval: 5s
-      timeout: 3s
+      interval: 3s
+      timeout: 2s
       retries: 5
+      start_period: 5s
 
 networks:
   redis-cluster:

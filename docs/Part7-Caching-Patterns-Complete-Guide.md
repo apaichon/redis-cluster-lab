@@ -51,6 +51,15 @@ cd /path/to/redis-cluster-lab
 
 # Start all services (Redis Cluster + PostgreSQL)
 docker-compose up -d
+
+# Initialize Redis Cluster (create cluster, assign slots)
+make init
+
+# Start spare nodes for scaling exercises (optional)
+make start-spare
+
+# Initialize PostgreSQL schema and seed data
+make init-db
 ```
 
 ### Step 1.2: Verify Redis Cluster
@@ -146,13 +155,13 @@ App ──► PostgreSQL ──► App        App ──► Redis (fast!) ──
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│  Redis Type    │  Cache Use Case                      │
+│  Redis Type    │  Cache Use Case                     │
 ├──────────────────────────────────────────────────────┤
-│  STRING        │  JSON objects (event, reservation)   │
-│  HASH          │  Structured records (seat statuses)  │
-│  SORTED SET    │  Rankings, leaderboards, waitlists   │
-│  SET           │  Unique collections, membership      │
-│  LIST          │  Queues, recent items                 │
+│  STRING        │  JSON objects (event, reservation)  │
+│  HASH          │  Structured records (seat statuses) │
+│  SORTED SET    │  Rankings, leaderboards, waitlists  │
+│  SET           │  Unique collections, membership     │
+│  LIST          │  Queues, recent items               │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -664,7 +673,7 @@ func (c *ReadThroughCache) loadAndCache(eventID, cacheKey string) (*models.Event
 ```go
 // Read-Through for expensive computed data
 func (c *ReadThroughCache) GetEventStats(eventID string) (*models.EventStats, error) {
-    cacheKey := fmt.Sprintf("{event:%s}:computed_stats", eventID)
+    cacheKey := fmt.Sprintf("{event:%s}:stats", eventID)
 
     // Try cache first
     data, err := c.rdb.Get(c.ctx, cacheKey).Result()
@@ -725,7 +734,7 @@ docker exec redis-1 redis-cli -p 7001 -c DEL "{event:$EVENT_ID}"
 # Expected: "Key not found" (because get-key only checks Redis)
 
 # Step 3: Now use the application command (which has fallback/read-through logic)
-./ticket-reservation availability $EVENT_ID
+./ticket-reservation availability $EVENT_ID --pattern read-through
 # Expected: Stats loaded from PostgreSQL
 
 # Step 4: Check Redis — the read automatically re-populated the cache
@@ -741,7 +750,7 @@ docker exec redis-1 redis-cli -p 7001 -c EXISTS "{event:$EVENT_ID}"
 
 # Call 1 — cold cache (loads from PG)
 docker exec redis-1 redis-cli -p 7001 -c DEL "{event:$EVENT_ID}:stats"
-./ticket-reservation availability $EVENT_ID
+./ticket-reservation availability $EVENT_ID --pattern read-through
 
 # Call 2 — warm cache (served from Redis)
 ./ticket-reservation availability $EVENT_ID
@@ -758,7 +767,7 @@ docker exec redis-1 redis-cli -p 7001 -c DEL "{event:$EVENT_ID}:stats"
 Proactively **refresh cache entries before they expire**. When a cached item's TTL drops below a threshold, a background process reloads it from the DB — so the next read always hits a warm cache.
 
 ```
-        ┌──────────────────────────────────────┐
+        ┌───────────────────────────────────────┐
         │          TIMELINE                     │
         │                                       │
         │  SET (TTL=60s)                        │
@@ -779,7 +788,7 @@ Proactively **refresh cache entries before they expire**. When a cached item's T
         │  │          EX 60s (reset) │     │    │
         │  │                         │     │    │
         │  │                    Never expires!  │
-        └──────────────────────────────────────┘
+        └───────────────────────────────────────┘
 ```
 
 ### 5.2 Code Example — Refresh-Ahead for Hot Events
@@ -1669,7 +1678,7 @@ In production, you combine multiple patterns for different data types:
 ```bash
 # Start server with PostgreSQL integration
 PG_DSN="postgres://postgres:postgres@localhost:5533/ticket_reservation?sslmode=disable" \
-  ./ticket-reservation server --addr :8080
+  ./ticket-reservation server --addr :9090
 ```
 
 ### 11.2 API Endpoints with Pattern Selection
@@ -1680,12 +1689,12 @@ Use the `?pattern=` query parameter to select which caching pattern to use:
 
 ```bash
 # Write-Through (default) — writes to both PG and Redis
-curl -s -X POST http://localhost:8080/events \
+curl -s -X POST http://localhost:9090/events \
   -H "Content-Type: application/json" \
   -d '{"name":"API Test","rows":3,"seats_per_row":5}' | jq .
 
 # Write-Around — writes to PG only, skips Redis
-curl -s -X POST "http://localhost:8080/events?pattern=write-around" \
+curl -s -X POST "http://localhost:9090/events?pattern=write-around" \
   -H "Content-Type: application/json" \
   -d '{"name":"Write-Around Test","rows":2,"seats_per_row":4}' | jq .
 ```
@@ -1696,36 +1705,36 @@ curl -s -X POST "http://localhost:8080/events?pattern=write-around" \
 export EVENT_ID="<event-id>"
 
 # Default (Fallback pattern)
-curl -s http://localhost:8080/events/$EVENT_ID | jq .
+curl -s http://localhost:9090/events/$EVENT_ID | jq .
 
 # Cache-Aside — app checks Redis, loads from PG on miss
-curl -s "http://localhost:8080/events/$EVENT_ID?pattern=cache-aside" | jq .
+curl -s "http://localhost:9090/events/$EVENT_ID?pattern=cache-aside" | jq .
 
 # Read-Through — cache auto-loads from PG
-curl -s "http://localhost:8080/events/$EVENT_ID?pattern=read-through" | jq .
+curl -s "http://localhost:9090/events/$EVENT_ID?pattern=read-through" | jq .
 
 # Refresh-Ahead — background refresh when TTL is low
-curl -s "http://localhost:8080/events/$EVENT_ID?pattern=refresh-ahead" | jq .
+curl -s "http://localhost:9090/events/$EVENT_ID?pattern=refresh-ahead" | jq .
 ```
 
 #### Get Availability
 
 ```bash
 # Default (Fallback)
-curl -s http://localhost:8080/events/$EVENT_ID/availability | jq .
+curl -s http://localhost:9090/events/$EVENT_ID/availability | jq .
 
 # Read-Through — auto-load computed stats
-curl -s "http://localhost:8080/events/$EVENT_ID/availability?pattern=read-through" | jq .
+curl -s "http://localhost:9090/events/$EVENT_ID/availability?pattern=read-through" | jq .
 ```
 
 #### Get Seats
 
 ```bash
 # Default — available seats only
-curl -s http://localhost:8080/events/$EVENT_ID/seats | jq .
+curl -s http://localhost:9090/events/$EVENT_ID/seats | jq .
 
 # Cache-Aside — all seats with full status map
-curl -s "http://localhost:8080/events/$EVENT_ID/seats?pattern=cache-aside" | jq .
+curl -s "http://localhost:9090/events/$EVENT_ID/seats?pattern=cache-aside" | jq .
 ```
 
 ### 11.3 Supported Patterns per Endpoint
@@ -2231,12 +2240,12 @@ docker exec postgres psql -U postgres -d ticket_reservation -c \
 │ Key: reservation:<id>    │ Tables: reservations +                  │
 │ Value: full JSON         │   reservation_seats                     │
 │ Seats: embedded array    │ Seats: normalized join table            │
-│ TTL: 15min/none/24hr     │ No TTL (permanent)                     │
+│ TTL: 15min/none/24hr     │ No TTL (permanent)                      │
 ├──────────────────────────┼─────────────────────────────────────────┤
-│ Fast single-key read     │ Rich queries (by user, event, status)  │
-│ Auto-expire pending      │ Never auto-deletes                     │
+│ Fast single-key read     │ Rich queries (by user, event, status)   │
+│ Auto-expire pending      │ Never auto-deletes                      │
 │ No JOIN support          │ JOIN with events, seats tables          │
-│ ~0.5ms per GET           │ ~5ms per SELECT with JOIN              │
+│ ~0.5ms per GET           │ ~5ms per SELECT with JOIN               │
 └──────────────────────────┴─────────────────────────────────────────┘
 ```
 
